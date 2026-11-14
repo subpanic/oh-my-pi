@@ -297,6 +297,10 @@ During asynchronous disposal, the session records and synchronously flushes its 
 
 Only after work capable of appending session entries has settled does disposal clean up an empty moved session, close the `SessionManager`, close provider session state, disconnect the agent, and remove listeners. A failure from the final persistence cleanup or `SessionManager.close()` rejects the shared disposal promise; individual provider-session close failures are logged.
 
+For an embedded child that must honor per-agent MCP isolation, acquire a lease with `acquireAgentMCPManager(parentManager, signal)` from `@oh-my-pi/pi-coding-agent/sdk` before constructing its proxies. Pass `lease.manager` as `mcpManager` and `() => lease.dispose()` as `disposeMCPManager`; if construction fails, dispose the lease yourself. The built-in subagent and `/tan` paths do this automatically. A caller that supplies a manager without a disposer remains a borrower and must not disconnect that manager.
+
+The lease combines existing shared connections with private instances of stdio servers configured with `isolation: "agent"`. Private state lasts for the live session, not the persisted transcript; reconnect, disposal/parking followed by revival, or reload can invalidate server-local IDs. See [MCP configuration](./mcp-config.md#per-agent-stdio-instances).
+
 ## Tools and extension integration
 
 ### Built-ins and filtering

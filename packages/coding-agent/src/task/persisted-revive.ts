@@ -20,7 +20,7 @@ import type { AsyncJobManagerApi } from "../async";
 import type { PreparedExtension } from "../extensibility/extensions/types";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
-import { createAgentSession } from "../sdk";
+import { type AgentMCPManagerLease, acquireAgentMCPManager, createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import type { ArtifactManagerApi } from "../session/artifacts";
@@ -41,6 +41,7 @@ import {
 	compactionThresholdSettings,
 	createSubagentSettings,
 	followMCPTools,
+	type MCPToolFollower,
 	replayRevivedAgentStart,
 	softRequestBudgetFor,
 	subagentRetryFallbackRole,
@@ -425,10 +426,29 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	const restrictToolNames = restoredSeance !== undefined || init.restrictToolNames === true;
 	// The spawn's result contract: a session persisted without `yield` returned its final message.
 	const structured = revivedToolNames.includes("yield");
-	const mcpManager = restrictToolNames ? undefined : MCPManager.instance();
-	// Subscribe before minting proxies so a manager change during startup is replayed on bind.
-	// The revived session reopens its own view, keeping the tools its earlier requests rendered.
-	const mcpFollower = mcpManager ? followMCPTools(mcpManager, { scope: reopened.getSessionId() }) : undefined;
+	// A cold revive reacquires from the canonical root, never a parent's private
+	// view or this transcript's dead server-local ids.
+	const mcpSource = restrictToolNames ? undefined : MCPManager.instance();
+	let mcpLease: AgentMCPManagerLease | undefined;
+	let mcpFollower: MCPToolFollower | undefined;
+	try {
+		mcpLease = mcpSource ? await acquireAgentMCPManager(mcpSource) : undefined;
+		// Subscribe before minting proxies so a manager change during startup is replayed on bind.
+		mcpFollower = mcpLease ? followMCPTools(mcpLease.manager, { scope: reopened.getSessionId() }) : undefined;
+	} catch (error) {
+		try {
+			await mcpLease?.dispose();
+		} catch {
+			// Report the acquisition failure; the transcript still has to be released.
+		}
+		await reopened.close();
+		throw error;
+	}
+	// A const alias preserves the narrowed lease inside the closure the session
+	// retains for disposal; the leased `let` above only exists for failure cleanup.
+	const ownedMCPLease = mcpLease;
+	const mcpManager = ownedMCPLease?.manager;
+	const disposeMCPManager = ownedMCPLease ? () => ownedMCPLease.dispose() : undefined;
 	const mcpProxyTools = mcpFollower?.proxyTools() ?? [];
 
 	let session: AgentSession;
@@ -494,8 +514,11 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 						preloadedCustomToolPaths: [],
 					}
 				: {
-						enableMCP: !mcpManager,
+						enableMCP: true,
 						mcpManager,
+						// Owner-bound view, so session teardown awaits closing only its
+						// private instance set; the root/shared servers stay untouched.
+						disposeMCPManager,
 						mcpTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
 						mcpToolScope: mcpFollower?.scope,
 					}),
@@ -503,6 +526,11 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		}));
 	} catch (error) {
 		mcpFollower?.dispose();
+		try {
+			await mcpLease?.dispose();
+		} catch {
+			// Prefer the session-startup failure over a late private-instance teardown.
+		}
 		throw error;
 	}
 	// A per-call worker runs only on its exact saved model, never a similarly named survivor.

@@ -8,6 +8,10 @@
  *   notification subscriptions are held on main per worker and dropped when it exits, and the
  *   worker's `MCPManager.instance()/load()/available()` answer from main's process global. A worker
  *   never connects MCP servers itself (`createAgentSession` skips discovery off the main thread).
+ *   Owner-bound agent scopes cross as their own kind (`"mcp-agent-scope"`); each acquisition is
+ *   tracked per worker and closed when it exits. A worker exit also aborts acquisitions that are
+ *   still starting (a stalled handshake cannot outlive its owner), and one that resolves after the
+ *   worker is gone is closed instead of retained.
  * - **Tool contexts** (`"custom-tool-context"`, see `./tool-context`): main-thread tools called from a
  *   worker child receive a snapshot context instead of the worker's live objects.
  * - **`LocalProtocolOptions`** (`"local-protocol-options"`): a main-side options object reaches a
@@ -28,14 +32,26 @@ import type { CustomTool } from "../../extensibility/custom-tools/types";
 import { importExtensionModule } from "../../extensibility/extensions/loader";
 import type { ExtensionFactory, PreparedExtension } from "../../extensibility/extensions/types";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
-import { MCPManager, type MCPManagerApi, type MCPManagerGlobal, type MCPToolScope } from "../../mcp/manager";
+import {
+	MCPAgentScope,
+	MCPManager,
+	type MCPManagerApi,
+	type MCPManagerGlobal,
+	type MCPToolScope,
+} from "../../mcp/manager";
 import type { ExecutorOptions } from "../../task/executor";
 import { isMainThread } from "../identity";
 import type { MainThreadLink, WorkerThreadLink } from "../protocol";
 import { type RpcCodec, type RpcServe, rpcSync } from "../rpc";
 import { trackWorkerSubscription } from "./support";
 import type { ThreadService, WorkerPeer } from "../services";
-import { MCP_MANAGER_KIND, type McpManagerProtocol, type McpToolsReply, RemoteMCPManager } from "./mcp-remote";
+import {
+	MCP_AGENT_SCOPE_KIND,
+	MCP_MANAGER_KIND,
+	type McpManagerProtocol,
+	type McpToolsReply,
+	RemoteMCPManager,
+} from "./mcp-remote";
 import { toWorkerTelemetryConfig } from "./telemetry";
 import { toolContextCodec } from "./tool-context";
 
@@ -123,8 +139,9 @@ export function toWorkerCustomTool<TParams extends TSchema, TDetails>(
  *   call this inside the parent's `execute_tool task` context).
  *
  * Everything else in this module's scope crosses automatically through codecs and exported
- * classes (`mcpManager`, `localProtocolOptions`, `preloadedPreparedExtensions`, tool contexts);
- * `perCallModelGrants` crosses intact (its `settings` becomes the worker's live mirror).
+ * classes (`mcpManager` roots and owner-bound agent scopes, `localProtocolOptions`,
+ * `preloadedPreparedExtensions`, tool contexts); `perCallModelGrants` crosses intact (its
+ * `settings` becomes the worker's live mirror).
  */
 export function bridgeIntegrationOptions(options: ExecutorOptions): ExecutorOptions {
 	const bridged: ExecutorOptions = { ...options };
@@ -278,13 +295,66 @@ const preparedExtensionCodec: RpcCodec<PreparedExtension> = {
 // MCP manager (main side)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Main-side subscriptions one worker holds, dropped when it exits. */
+/** Main-side subscriptions and owned scopes one worker holds, dropped when it exits. */
 class PeerIntegrationState {
 	readonly subscriptions = new Set<() => void>();
+	/** Scopes acquired through this worker's link; each acquisition is a distinct, independently owned handle. */
+	readonly #scopes = new Set<MCPAgentScope>();
+	/**
+	 * Aborted when this worker exits: cancels acquisitions still starting there, so a stalled
+	 * handshake cannot leave a private process owned by a dead worker.
+	 */
+	readonly #acquisitionAbort = new AbortController();
+	/** Set once the worker exited: anything acquired afterwards is closed instead of retained. */
+	#released = false;
+
+	/** Signal to combine with a caller's acquisition signal; aborting cancels startup and rejects. */
+	get acquisitionSignal(): AbortSignal {
+		return this.#acquisitionAbort.signal;
+	}
+
+	/** Take ownership of a scope acquired for this worker; a late acquisition is closed immediately. */
+	own(scope: MCPAgentScope): void {
+		if (this.#released) {
+			this.#close(scope);
+			return;
+		}
+		this.#scopes.add(scope);
+	}
+
+	/** The caller disposed `scope`; stop closing it again when this worker exits. */
+	forget(scope: MCPManagerApi): void {
+		if (scope instanceof MCPAgentScope) this.#scopes.delete(scope);
+	}
 
 	release(): void {
+		this.#released = true;
+		// Cancel acquisitions whose private startup is still in flight; the late-result guard below
+		// only covers a resolver that raced the abort.
+		this.#acquisitionAbort.abort(new Error("MCP worker exited during scope acquisition"));
 		// Each unsubscribe deletes its own (already visited) entry, which Set iteration tolerates.
-		for (const unsubscribe of this.subscriptions) unsubscribe();
+		for (const unsubscribe of this.subscriptions) {
+			try {
+				unsubscribe();
+			} catch (error) {
+				logger.debug("Worker MCP unsubscribe failed", { error: String(error) });
+			}
+		}
+		for (const scope of this.#scopes) this.#close(scope);
+		this.#scopes.clear();
+	}
+
+	/** Close one scope's private instances and listeners off the caller's path; idempotent and root-safe. */
+	#close(scope: MCPAgentScope): void {
+		this.#scopes.delete(scope);
+		try {
+			scope
+				.disposeAgentScope()
+				.catch((error: unknown) => logger.debug("Worker MCP scope disposal failed", { error: String(error) }));
+		} catch (error) {
+			// One scope must not keep the worker's remaining handles open.
+			logger.debug("Worker MCP scope disposal failed", { error: String(error) });
+		}
 	}
 }
 
@@ -306,15 +376,30 @@ function settleQuietly(result: unknown): void {
 }
 
 /** `scope`'s tools as worker views, omitted when `knownVersion` is still current. */
-function toolsReply(manager: MCPManager, knownVersion: number, scope: MCPToolScope | undefined): McpToolsReply {
+function toolsReply(manager: MCPManagerApi, knownVersion: number, scope: MCPToolScope | undefined): McpToolsReply {
 	const version = manager.toolViewsRevision;
 	if (version === knownVersion) return { version };
 	return { version, tools: manager.getTools(scope).map(tool => toWorkerCustomTool(tool)) };
 }
 
-function serveMcpManager(state: PeerIntegrationState): RpcServe<MCPManager, McpManagerProtocol> {
+function serveMcpManager(state: PeerIntegrationState): RpcServe<MCPManagerApi, McpManagerProtocol> {
 	return {
-		tools: toolsReply,
+		toolViewsRevision: manager => manager.toolViewsRevision,
+		createAgentScope: async (manager, signal) => {
+			// A worker that dies mid-startup aborts its pending acquisition instead of leaving a
+			// private handshake (possibly `timeout: 0`) alive with no future owner.
+			const scope = await manager.createAgentScope(
+				signal ? AbortSignal.any([state.acquisitionSignal, signal]) : state.acquisitionSignal,
+			);
+			// Every acquisition is a new owner-bound handle, including the zero-private subset case.
+			if (scope instanceof MCPAgentScope) state.own(scope);
+			return scope;
+		},
+		disposeAgentScope: async manager => {
+			state.forget(manager);
+			await manager.disposeAgentScope();
+		},
+		tools: (manager, knownVersion, scope) => toolsReply(manager, knownVersion, scope),
 		openToolScope: (manager, scope, seed) => manager.openToolScope(scope, seed),
 		trackToolCall: (manager, scope, toolCallId) =>
 			trackWorkerSubscription(state.subscriptions, manager.trackToolCall(scope, toolCallId)),
@@ -395,10 +480,18 @@ export const integrationsThreadService: ThreadService = {
 
 	installMain(peer: WorkerPeer): void {
 		registerCodecs(peer.link);
-		peer.link.exportClass<MCPManager, McpManagerProtocol>(
+		const state = peerState(peer.link);
+		// Scope recognition first: owner-bound scopes are never the root singleton, and the
+		// registration order is the encoder's precedence if that ever changes.
+		peer.link.exportClass<MCPManagerApi, McpManagerProtocol>(
+			MCP_AGENT_SCOPE_KIND,
+			(value): value is MCPManagerApi => value instanceof MCPAgentScope,
+			serveMcpManager(state),
+		);
+		peer.link.exportClass<MCPManagerApi, McpManagerProtocol>(
 			MCP_MANAGER_KIND,
-			(value): value is MCPManager => value instanceof MCPManager,
-			serveMcpManager(peerState(peer.link)),
+			(value): value is MCPManagerApi => value instanceof MCPManager,
+			serveMcpManager(state),
 		);
 	},
 
@@ -413,6 +506,10 @@ export const integrationsThreadService: ThreadService = {
 	installWorker(link: WorkerThreadLink): void {
 		registerCodecs(link);
 		link.importClass<RemoteMCPManager, McpManagerProtocol>(MCP_MANAGER_KIND, remote => new RemoteMCPManager(remote));
+		link.importClass<RemoteMCPManager, McpManagerProtocol>(
+			MCP_AGENT_SCOPE_KIND,
+			remote => new RemoteMCPManager(remote, true),
+		);
 	},
 
 	boot(globals: unknown): void {

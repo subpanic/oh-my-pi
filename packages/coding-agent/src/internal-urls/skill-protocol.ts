@@ -8,6 +8,9 @@
  * - skill://<name>/<path> - Reads relative path within skill's baseDir
  * - skill://<namespace>/<name>[/<path>] - Same, for a collision-namespaced skill
  * - Any skill:// URI an MCP server advertises, when no loaded skill owns it - Reads that MCP resource
+ *   through the caller session's own manager; a session that explicitly excludes MCP, or enables it
+ *   without its own manager, never reaches the process-global manager, while a caller with no
+ *   session or a CLI-style session that leaves `enableMCP` unset keeps the global fallback.
  */
 import type * as fsTypes from "node:fs";
 import * as fs from "node:fs/promises";
@@ -22,7 +25,7 @@ import {
 	type Skill,
 	type SkillRediscoveryHost,
 } from "../extensibility/skills";
-import { MCPManager, type MCPManagerApi } from "../mcp/manager";
+import type { MCPManagerApi } from "../mcp/manager";
 import skillDoc from "../prompts/internal-urls/skill.md" with { type: "text" };
 import {
 	buildDirectoryResource,
@@ -31,7 +34,7 @@ import {
 	UrlContainmentError,
 	validateRelativePath,
 } from "./filesystem-resource";
-import { readMcpResource } from "./mcp-protocol";
+import { callerMcpAvailable, loadCallerMcpManager, readMcpResource } from "./mcp-protocol";
 import type {
 	InternalResource,
 	InternalUrl,
@@ -325,7 +328,7 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			let mcpManager: MCPManagerApi | undefined;
 			try {
 				mcpManager = await withTimeout(
-					MCPManager.load(),
+					loadCallerMcpManager(context),
 					UNKNOWN_SKILL_MCP_WAIT_MS,
 					"MCP startup outlasted the unknown-skill wait",
 					context?.signal,
@@ -375,7 +378,7 @@ export class SkillProtocolHandler implements ProtocolHandler {
 				context?.containSkillPaths === true,
 			);
 		} catch (error) {
-			if (error instanceof UnknownSkillError && !options?.localOnly && MCPManager.available()) return null;
+			if (error instanceof UnknownSkillError && !options?.localOnly && callerMcpAvailable(context)) return null;
 			throw error;
 		}
 		return options?.create || target.stats ? target.path : null;

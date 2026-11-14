@@ -14,7 +14,7 @@ import { type ExtensionModule, extensionModuleCapability } from "../capability/e
 import { readDirEntries, readFile } from "../capability/fs";
 import { type Hook, hookCapability } from "../capability/hook";
 import { type Instruction, instructionCapability } from "../capability/instruction";
-import { type MCPServer, mcpCapability } from "../capability/mcp";
+import { inspectMCPAgentIsolation, type MCPServer, mcpCapability } from "../capability/mcp";
 import { type Prompt, promptCapability } from "../capability/prompt";
 import { type Rule, ruleCapability } from "../capability/rule";
 import { type Settings, settingsCapability } from "../capability/settings";
@@ -193,12 +193,34 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				);
 			}
 
+			// Isolation is an OMP-owned, stdio-only opt-in. An invalid value or a
+			// remote transport reserves the name with a non-connectable entry
+			// (fail closed): the server never launches, and a same-named
+			// lower-priority definition cannot silently start shared instead.
+			const isolationCheck = inspectMCPAgentIsolation(serverConfig.isolation, {
+				transport: serverConfig.type,
+				command: serverConfig.command,
+				url: serverConfig.url,
+			});
+			if (isolationCheck.error !== undefined) {
+				logger.warn(`MCP server "${serverName}": ${isolationCheck.error}; ignoring server`);
+				result.push({
+					name: serverName,
+					enabled: false,
+					isolationError: `MCP server "${serverName}": ${isolationCheck.error}`,
+					_source: createSourceMeta(PROVIDER_ID, path, level),
+				});
+				continue;
+			}
+			const isolation = isolationCheck.isolation;
+
 			result.push({
 				name: serverName,
 				enabled,
 				timeout,
 				requestIdFormat,
 				instructions,
+				...(isolation === "agent" && { isolation }),
 				command: serverConfig.command as string | undefined,
 				args: serverConfig.args as string[] | undefined,
 				env: serverConfig.env as Record<string, string> | undefined,

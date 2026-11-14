@@ -69,6 +69,14 @@ export interface MCPAuthConfig {
 /** Encoding used for outgoing JSON-RPC request ids. */
 export type MCPRequestIdFormat = "string" | "number";
 
+/**
+ * Per-agent isolation mode for OMP-owned stdio server configs.
+ *
+ * `"agent"` gives every live agent its own private server instance; an omitted
+ * value keeps the existing session-wide shared instance.
+ */
+export type MCPAgentIsolation = "agent";
+
 /** Base server config with shared options */
 interface MCPServerConfigBase {
 	/** Whether this server is enabled (default: true) */
@@ -124,6 +132,18 @@ export interface MCPStdioServerConfig extends MCPServerConfigBase {
 	/** Env keys whose values are final package data; auth resolution keeps them verbatim. */
 	envLiteralKeys?: string[];
 	cwd?: string;
+	/**
+	 * Per-agent isolation for OMP-owned stdio server configs (native config,
+	 * standalone `mcp.json`, and OMP plugins).
+	 *
+	 * `"agent"` makes every live agent acquire its own private instance of the
+	 * server; omitted keeps the existing session-wide shared instance. Only the
+	 * stdio transport has this option — HTTP/SSE configs do not declare the
+	 * field, and OMP-owned loaders plus `validateServerConfig` reject a runtime
+	 * value there instead of silently launching the server shared. Providers
+	 * that translate another tool's config do not parse this key.
+	 */
+	isolation?: MCPAgentIsolation;
 }
 
 /** HTTP server configuration (Streamable HTTP transport) */

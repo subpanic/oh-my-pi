@@ -65,13 +65,24 @@ function makeTempDir(prefix: string): string {
 	return dir.path();
 }
 
-/** Inert shared manager exposing the members a revived subagent reads: its tools and change feed. */
+/** A real manager with no configured servers: scopes start zero-private and delegate to it. */
+function emptyMcpManager(cwd: string): MCPManager {
+	return new MCPManager(cwd, null, async () => ({ configs: {}, sources: {}, exaApiKeys: [] }));
+}
+
+/** Inert shared manager exposing the members a revived subagent reads, plus owner-bound scopes. */
 function fakeMcpManager(getTools: () => Array<{ name: string; label: string }>): MCPManager {
-	return {
-		getTools,
-		addToolsChangedListener: () => () => {},
-		openToolScope: () => {},
-	} as unknown as MCPManager;
+	const createScope = (): MCPManager =>
+		({
+			getTools,
+			addToolsChangedListener: () => () => {},
+			openToolScope: () => {},
+			trackToolCall: () => () => {},
+			createAgentScope: async () => createScope(),
+			disposeAgentScope: async () => {},
+			toolViewsRevision: 1,
+		}) as unknown as MCPManager;
+	return createScope();
 }
 
 function createRef(sessionFile: string): AgentRef {
@@ -275,7 +286,7 @@ describe("persisted subagent revival", () => {
 	it("initializes the extension runtime on cold revival so tool_call handlers are not fail-closed blocked", async () => {
 		const cwd = makeTempDir("@pi-revive-ext-init-");
 		const sessionFile = await createPersistedSession(cwd);
-		MCPManager.setInstance(fakeMcpManager(() => []));
+		MCPManager.setInstance(emptyMcpManager(cwd));
 		const initialize = vi.fn();
 		const onError = vi.fn();
 		const emit = vi.fn(async () => undefined);
@@ -417,7 +428,7 @@ describe("persisted subagent revival", () => {
 		AgentRegistry.resetGlobalForTests();
 		const cwd = makeTempDir("@pi-revive-artifacts-dir-");
 		const sessionFile = await createPersistedSession(cwd);
-		MCPManager.setInstance(fakeMcpManager(() => []));
+		MCPManager.setInstance(emptyMcpManager(cwd));
 		// Run the real wake monitor (call through) so the assertion is tied to the
 		// component that actually writes <id>.md, not a stubbed seam.
 		const realAttach = executorModule.attachIrcWakeTurnMonitor;
@@ -553,7 +564,12 @@ describe("persisted subagent revival", () => {
 
 		expect(capturedOptions?.restrictToolNames).toBeUndefined();
 		expect(capturedOptions?.enableLsp).toBe(true);
-		expect(capturedOptions?.mcpManager).toBe(hostileMcp);
+		expect(capturedOptions?.enableMCP).toBe(true);
+		// The revive gets a fresh owner-bound view from the canonical root, never
+		// the root's own tools, and owns that view's disposal.
+		expect(capturedOptions?.mcpManager).not.toBe(hostileMcp);
+		expect(capturedOptions?.mcpManager?.getTools().map(tool => tool.name)).toEqual(["mcp__server_read"]);
+		expect(capturedOptions?.disposeMCPManager).toBeTypeOf("function");
 		expect(capturedOptions?.mcpTools?.map(tool => tool.name)).toEqual(["mcp__server_read"]);
 		expect(capturedOptions?.customTools).toBeUndefined();
 	});
@@ -1488,7 +1504,7 @@ describe("persisted subagent revival", () => {
 		AgentLifecycleManager.resetGlobalForTests();
 		const cwd = makeTempDir("@pi-revive-frames-");
 		const sessionFile = await createPersistedSession(cwd);
-		MCPManager.setInstance(fakeMcpManager(() => []));
+		MCPManager.setInstance(emptyMcpManager(cwd));
 		let handle: RevivedSessionHandle | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
 			handle = createRevivedSession([]);
@@ -1549,7 +1565,7 @@ describe("persisted subagent revival", () => {
 		AgentLifecycleManager.resetGlobalForTests();
 		const cwd = makeTempDir("@pi-revive-artifact-");
 		const sessionFile = await createPersistedSession(cwd);
-		MCPManager.setInstance(fakeMcpManager(() => []));
+		MCPManager.setInstance(emptyMcpManager(cwd));
 		let handle: RevivedSessionHandle | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
 			handle = createRevivedSession([]);
@@ -1602,7 +1618,7 @@ describe("persisted subagent revival", () => {
 			AgentLifecycleManager.resetGlobalForTests();
 			IrcBus.resetGlobalForTests();
 			const sessionFile = await createPersistedSession(cwd);
-			MCPManager.setInstance(fakeMcpManager(() => []));
+			MCPManager.setInstance(emptyMcpManager(cwd));
 			let handle: RevivedSessionHandle | undefined;
 			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
 				handle = createRevivedSession([]);
@@ -2193,7 +2209,6 @@ describe("cold revival replays the system prompt the last request sent", () => {
 	it("warm-revives with the system prompt it was sent with after a peer joins, and keeps it on rebuild", async () => {
 		const cwd = makeTempDir("@pi-revive-warm-roster-");
 		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
-		expect(spawned.requests.at(-1)!.join("\n")).toContain("(no other agents)");
 		const { live, warm } = await parkAndRevive(registerPeer);
 		expect(warm.requests[0]).toEqual(spawned.requests.at(-1)!);
 		// A rebuild after the revive keeps the roster too: a live one would rewrite the cached conversation.

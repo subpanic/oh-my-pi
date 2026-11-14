@@ -228,7 +228,11 @@ Operationally:
 - detaches `onClose` for all active transports, then closes them with `Promise.allSettled`,
 - clears pending maps, sources, saved configs, connections, subscriptions, resource refreshes, reconnect history, and manager tools.
 
-Top-level sessions own managers they create. `AgentSession.dispose()` disconnects that owned manager with a 3-second cleanup timeout and logs cleanup failure; a subagent/session given `options.mcpManager` borrows the parent manager and does not disconnect it. `/mcp reload` deliberately reuses the manager object after `disconnectAll`, so installed callbacks/listeners remain available for the next discovery cycle.
+Top-level sessions own managers they create. `AgentSession.dispose()` disconnects an owned manager with a 3-second cleanup timeout and logs cleanup failure. Subagents acquire an `MCPAgentScope`: a main-thread view combining shared root connections with private instances of stdio servers configured with `isolation: "agent"`. Disposing the view releases only its private instances and listeners; it never disconnects the shared root manager.
+
+The worker RPC bridge carries the owner-bound view, not a worker-wide private manager: multiple agents on one worker and nested agents remain distinct. Startup cancellation and worker exit abort pending acquisitions. Idle/follow-up turns retain the view; committed parking and disposal release it, and revival acquires a fresh view. Server-local state does not survive that recreation.
+
+`/mcp reload` deliberately reuses the root manager after `disconnectAll`. It closes private instances while live views remain subscribed, then reconciles them against the reloaded definitions. Isolated names stay hidden from the shared route while private startup is pending or fails. Caller-bound `mcp://` and MCP-backed `skill://` resolution use the same view; an explicitly MCP-disabled caller cannot fall back to the process-global manager.
 
 ## Failure modes and guarantees
 

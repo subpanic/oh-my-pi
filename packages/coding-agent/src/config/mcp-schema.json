@@ -153,6 +153,11 @@
             "timeout": {},
             "requestIdFormat": {},
             "instructions": {},
+            "isolation": {
+              "type": "string",
+              "enum": ["agent"],
+              "description": "Give every live agent its own private instance of this stdio server. Omit to keep the existing session-wide shared instance. OMP-specific: supported by native config (`.omp/mcp.json`, `~/.omp/agent/mcp.json`), standalone project `mcp.json`/`.mcp.json`, and OMP extension packages; imported tool configs ignore it. Not valid for http/sse servers."
+            },
             "auth": {},
             "oauth": {},
             "type": {

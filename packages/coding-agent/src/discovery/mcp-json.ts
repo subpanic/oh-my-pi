@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { logger, tryParseJson } from "@oh-my-pi/pi-utils";
 import { registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
-import { type MCPServer, mcpCapability } from "../capability/mcp";
+import { inspectMCPAgentIsolation, type MCPServer, mcpCapability } from "../capability/mcp";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { createSourceMeta, expandEnvVarsDeep, parseRequestIdFormat } from "./helpers";
 
@@ -28,6 +28,7 @@ interface MCPConfigFile {
 			timeout?: number;
 			requestIdFormat?: "string" | "number";
 			instructions?: boolean;
+			isolation?: unknown;
 			command?: string;
 			args?: string[];
 			env?: Record<string, string>;
@@ -62,6 +63,26 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 
 	if (config.mcpServers) {
 		for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
+			// Isolation is OMP-owned and stdio-only. A bad opt-in reserves the
+			// name with a non-connectable entry, so a same-named lower-priority
+			// server cannot silently launch shared instead.
+			const isolationCheck = inspectMCPAgentIsolation(serverConfig.isolation, {
+				transport: serverConfig.type,
+				command: serverConfig.command,
+				url: serverConfig.url,
+			});
+			if (isolationCheck.error !== undefined) {
+				logger.warn(`MCP server "${name}": ${isolationCheck.error}, ignoring server`);
+				servers.push({
+					name,
+					enabled: false,
+					isolationError: `MCP server "${name}": ${isolationCheck.error}`,
+					_source: source,
+				});
+				continue;
+			}
+			const isolation = isolationCheck.isolation;
+
 			// Runtime type validation for user-controlled JSON values
 			let enabled: boolean | undefined;
 			if (serverConfig.enabled !== undefined) {
@@ -107,6 +128,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				timeout,
 				requestIdFormat,
 				instructions,
+				...(isolation === "agent" && { isolation }),
 				command: serverConfig.command,
 				args: serverConfig.args,
 				env: serverConfig.env,

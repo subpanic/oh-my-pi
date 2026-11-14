@@ -78,8 +78,10 @@ import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-life
 import { AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import {
+	type AgentMCPManagerLease,
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
+	acquireAgentMCPManager,
 	createAgentSession,
 	discoverAuthStorage,
 } from "../sdk";
@@ -578,6 +580,7 @@ export interface ExecutorOptions {
 	 * tool against its own `CustomToolAPI` (cwd, exec, pushPendingAction, UI).
 	 */
 	preloadedCustomToolPaths?: ToolPathWithSource[];
+	/** The spawning session's manager; the child acquires its own owner-bound scope from it. */
 	mcpManager?: MCPManagerApi;
 	/** The spawning session's view of {@link mcpManager}; the child's view starts from it. */
 	mcpToolScope?: MCPToolScope;
@@ -1087,7 +1090,7 @@ export interface MCPToolFollower {
 	dispose(): void;
 }
 
-/** Which view of the shared manager a child session gets. */
+/** Which view of the child's MCP manager a session gets. */
 export interface MCPToolView {
 	/** The child session's id: a revived session reopens the view it had. */
 	scope: MCPToolScope;
@@ -1096,13 +1099,15 @@ export interface MCPToolView {
 }
 
 /**
- * Give a child session its own view of the parent's shared manager and keep
- * its MCP proxy tools in step with it. A child gets a spawn-time
- * {@link MCPToolFollower.proxyTools} snapshot and never owns the manager's
- * single-slot tool callback, so without this a `/mcp reload` — or a server
- * added, removed, or reconnected later — only reaches the owning session and
- * every live subagent keeps its stale set. Tools another session's calls make
- * a server add stay out of this view (see {@link MCPManagerApi.getTools}).
+ * Give a child session its own view of {@link mcpManager} and keep its MCP
+ * proxy tools in step with it. For a shared root this view isolates the child
+ * from later reloads and other sessions' grants; for an owner-bound scope
+ * acquired from that root it is the child's private manager. A child gets a
+ * spawn-time {@link MCPToolFollower.proxyTools} snapshot and never owns the
+ * manager's single-slot tool callback, so without this a `/mcp reload` — or a
+ * server added, removed, or reconnected later — only reaches the owning session
+ * and every live subagent keeps its stale set. Tools another session's calls
+ * make a server add stay out of this view (see {@link MCPManagerApi.getTools}).
  *
  * Subscribe BEFORE building the child's proxies: a change landing while the
  * session is still being created is recorded and replayed on {@link
@@ -4084,6 +4089,8 @@ interface SubagentPromptInputs {
  * The spawn-time inputs of a subagent session. The live run and the lifecycle reviver both build
  * their {@link createAgentSession} options from it, so the reviver retains this plain capture
  * rather than the spawning run's options, monitor, abort signals, progress sinks or settings.
+ * `options.mcpManager` is the canonical acquisition source captured from the spawner, never the
+ * live child's owner-bound scope: every build acquires a fresh scope from it.
  */
 interface SubagentSessionSpec {
 	options: Omit<
@@ -4118,14 +4125,20 @@ function buildSubagentSessionOptions(
 	expectedAgentRef: CreateAgentSessionOptions["expectedAgentRef"],
 	mcpFollower: MCPToolFollower | undefined,
 	launch?: SubagentLaunchInputs,
+	mcpLease?: AgentMCPManagerLease,
 ): CreateAgentSessionOptions {
 	const inputs = spec.prompt;
 	// MCP proxies are minted per build, not captured in the spec: a kept-alive
 	// subagent revived after `/mcp reload` must see the manager's current tools.
+	// A lease is the child's own owner-bound manager; `spec.options.mcpManager`
+	// stays the canonical parent source a warm revive acquires from.
 	const mcpTools = mcpFollower?.proxyTools() ?? [];
 	const customTools = spec.options.customTools ?? [];
+	const ownedMCPLease = mcpLease;
 	return {
 		...spec.options,
+		mcpManager: ownedMCPLease?.manager,
+		disposeMCPManager: ownedMCPLease ? () => ownedMCPLease.dispose() : undefined,
 		mcpTools: mcpTools.length > 0 ? mcpTools : undefined,
 		mcpToolScope: mcpFollower?.scope,
 		customTools: customTools.length > 0 ? customTools : undefined,
@@ -4314,32 +4327,55 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 			suppressBreadcrumb: true,
 			throwIfMissing: true,
 		});
-		if (!hasConversationalHistory(reopened.getEntries())) {
+		// `spec.options.mcpManager` is the canonical parent source captured at
+		// spawn, never the child's own disposed scope. Every failure below is before
+		// the revived session owns its scope, so one boundary releases the transcript
+		// and any partially acquired scope instead of leaking until root shutdown.
+		const mcpSource = capture.spec.options.mcpManager;
+		let mcpLease: AgentMCPManagerLease | undefined;
+		let mcpFollower: MCPToolFollower | undefined;
+		let agentAccountPools: Record<string, OAuthAccountPools>;
+		try {
+			if (!hasConversationalHistory(reopened.getEntries())) {
+				throw new Error(
+					`Cannot revive subagent "${id}": session file "${capture.sessionFile}" has no message history ` +
+						`(truncated to header/session_init). The agent was not revived.`,
+				);
+			}
+			if (capture.parentArtifactManager) {
+				reopened.adoptArtifactManager(capture.parentArtifactManager);
+			}
+			// The stash died with the parked manager: hand the pending, never-promoted
+			// family candidate to the fresh one so the first eligible request after
+			// revival still finds and persists it.
+			if (capture.pendingCacheCandidate !== undefined) {
+				reopened.setTaskSiblingCandidate(capture.pendingCacheCandidate);
+			}
+			await refreshSubagentIrcRoot(capture.spec.prompt, reopened, capture.sessionFile);
+			// Account pools are owner policy: take the live exact-name entry, as
+			// dispatch and persisted revival do, never the spawn-time copy. Validate
+			// BEFORE acquisition so a malformed changed setting cannot strand a scope.
+			agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(capture.settings.parent));
+			mcpLease = mcpSource ? await acquireAgentMCPManager(mcpSource) : undefined;
+			// The revived session opens its own view, seeded from the fresh scope's
+			// owner view; the parked scope's server-local ids are not resumable.
+			mcpFollower = mcpLease
+				? followMCPTools(
+						mcpLease.manager,
+						{ scope: reopened.getSessionId() },
+						explicitSubagentToolNames(capture.spec),
+					)
+				: undefined;
+		} catch (error) {
+			try {
+				await mcpLease?.dispose();
+			} catch {
+				// The transcript still needs its writer back; report the startup failure.
+			}
 			await reopened.close();
-			throw new Error(
-				`Cannot revive subagent "${id}": session file "${capture.sessionFile}" has no message history ` +
-					`(truncated to header/session_init). The agent was not revived.`,
-			);
+			throw error;
 		}
-		if (capture.parentArtifactManager) {
-			reopened.adoptArtifactManager(capture.parentArtifactManager);
-		}
-		// The stash died with the parked manager: hand the pending, never-promoted
-		// family candidate to the fresh one so the first eligible request after
-		// revival still finds and persists it.
-		if (capture.pendingCacheCandidate !== undefined) {
-			reopened.setTaskSiblingCandidate(capture.pendingCacheCandidate);
-		}
-		await refreshSubagentIrcRoot(capture.spec.prompt, reopened, capture.sessionFile);
-		const mcpManager = capture.spec.options.mcpManager;
-		// The revived session reopens its own view, keeping the tools its earlier requests rendered.
-		const mcpFollower = mcpManager
-			? followMCPTools(mcpManager, { scope: reopened.getSessionId() }, explicitSubagentToolNames(capture.spec))
-			: undefined;
 		let revived: AgentSession;
-		// Account pools are owner policy: take the live exact-name entry, as
-		// dispatch and persisted revival do, never the spawn-time copy.
-		const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(capture.settings.parent));
 		capture.spec.prompt.reviving = true;
 		// A session-local switch since spawn (a prewalk handoff) owns the model and effort: the
 		// transcript restores the effort, and the spawn selection only backs the model up when it is
@@ -4358,6 +4394,8 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 					reopened,
 					expectedAgentRef,
 					mcpFollower,
+					undefined,
+					mcpLease,
 				);
 				({ session: revived } = await createAgentSession({
 					...options,
@@ -4383,6 +4421,11 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 				}));
 			} catch (error) {
 				mcpFollower?.dispose();
+				try {
+					await mcpLease?.dispose();
+				} catch {
+					// Surface the session-creation failure, not a late scope teardown.
+				}
 				throw error;
 			}
 			mcpFollower?.bind(revived);
@@ -4641,6 +4684,10 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 	let openedSessionManager: SessionManager | undefined;
 	let untrackedSession: AgentSession | undefined;
 	let pendingSessionDisposal: Promise<void> | undefined;
+	/** Owner-bound MCP manager acquired for this run's child session. */
+	let mcpLease: AgentMCPManagerLease | undefined;
+	/** True once the live session owns the lease's disposal (via `disposeMCPManager`). */
+	let mcpLeaseTransferred = false;
 	const wakeOptions: IrcWakeTurnMonitorOptions = {
 		id,
 		index,
@@ -4911,7 +4958,30 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			}
 
 			const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
-			const mcpManager = enableMCP ? options.mcpManager : undefined;
+			// The parent's manager is only the acquisition source. The child owns a
+			// private scope for its whole life; `sessionSpec.options.mcpManager`
+			// keeps the source so a warm revive never reuses this (disposed) scope.
+			const mcpSource = enableMCP ? options.mcpManager : undefined;
+			if (mcpSource) {
+				checkAbort();
+				const acquisition = acquireAgentMCPManager(mcpSource, abortSignal);
+				try {
+					mcpLease = await awaitAbortable(acquisition);
+				} catch (error) {
+					// The abort race can strand a successful acquisition: close the
+					// instance set when it lands, or a cancelled spawn leaks servers.
+					void acquisition
+						.then(lease => lease.dispose())
+						.catch(cleanupError => {
+							logger.warn("Subagent MCP scope cleanup after cancelled startup failed", {
+								id,
+								error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+							});
+						});
+					throw error;
+				}
+			}
+			const mcpManager = mcpLease?.manager;
 
 			// Derive subagent-scoped telemetry from the parent's config so the
 			// child loop's spans nest under the parent's active execute_tool span
@@ -5022,7 +5092,10 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					enableIrc: options.enableIrc,
 					skipPythonPreflight,
 					enableMCP,
-					mcpManager,
+					// The capture keeps the spawning session's manager as the source a
+					// warm revive acquires from; the live session receives the acquired
+					// scope through `buildSubagentSessionOptions`.
+					mcpManager: mcpSource,
 					// MCP proxies are minted per build as `mcpTools` in buildSubagentSessionOptions.
 					customTools: options.customTools,
 					localProtocolOptions: options.localProtocolOptions,
@@ -5073,16 +5146,24 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			let sessionPromise: Promise<CreateAgentSessionResult> | undefined;
 			try {
 				sessionPromise = createAgentSession(
-					buildSubagentSessionOptions(sessionSpec, subagentSettings, sessionManager, null, mcpFollower, {
-						workPoolYieldItems: options.workPoolYieldItems ?? [],
-						// A revived session restores the tier history it persisted (including
-						// tiers a provider rejected or an extension changed since spawn); only
-						// the fresh spawn resolves the per-agent override.
-						resolveServiceTierByFamily,
-						onFirstChatDispatch: () => {
-							firstChatDispatchAt ??= performance.now();
+					buildSubagentSessionOptions(
+						sessionSpec,
+						subagentSettings,
+						sessionManager,
+						null,
+						mcpFollower,
+						{
+							workPoolYieldItems: options.workPoolYieldItems ?? [],
+							// A revived session restores the tier history it persisted (including
+							// tiers a provider rejected or an extension changed since spawn); only
+							// the fresh spawn resolves the per-agent override.
+							resolveServiceTierByFamily,
+							onFirstChatDispatch: () => {
+								firstChatDispatchAt ??= performance.now();
+							},
 						},
-					}),
+						mcpLease,
+					),
 				);
 				({ session } = await awaitAbortable(sessionPromise));
 				if (preparedSession) untrackedSession = session;
@@ -5129,6 +5210,9 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			sessionCreatedAt = performance.now();
 
 			monitor.setActiveSession(session);
+			// The live session now owns the acquired scope through `disposeMCPManager`;
+			// only failure paths before this point close it directly.
+			mcpLeaseTransferred = true;
 			if (preparedSession) untrackedSession = undefined;
 			// Run-state notifications precede deferrable wire-level `agent_end`,
 			// so adopted keep-alive lifecycle cannot get stuck during prompt unwind.
@@ -5478,6 +5562,16 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 							error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
 						});
 					}
+				}
+			}
+			if (mcpLease && !mcpLeaseTransferred) {
+				try {
+					await mcpLease.dispose();
+				} catch (cleanupError) {
+					logger.warn("Subagent MCP scope cleanup failed", {
+						id,
+						error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+					});
 				}
 			}
 			if (lateCleanups.length > 0) {

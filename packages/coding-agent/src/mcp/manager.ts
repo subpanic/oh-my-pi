@@ -12,6 +12,7 @@ import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import { invalidateCommandConfig, isCommandConfigValue, resolveConfigValue } from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage } from "../session/auth-storage";
+import { MCPAgentScope, type MCPAgentIsolationDefinition, type MCPAgentPrivateStartup } from "./agent-scope";
 import {
 	MCPConnectionTimeoutError,
 	connectToServer,
@@ -61,6 +62,8 @@ import type {
 	MCPTransport,
 } from "./types";
 import { MCPNotificationMethods } from "./types";
+
+export { MCPAgentScope, MCPAgentScopeStartupError } from "./agent-scope";
 
 export type McpCatalogChangeEvent = { serverName: string; kind: "resources" | "prompts" };
 export type MCPConfigLoader = (cwd: string, options?: LoadMCPConfigsOptions) => Promise<LoadMCPConfigsResult>;
@@ -131,6 +134,26 @@ function createMcpStartupFailure(serverName: string, error: string, source?: Sou
 	return source
 		? { type: "failed", serverName, error, sourcePath: source.path }
 		: { type: "failed", serverName, error };
+}
+
+/**
+ * Whether a server definition opts into per-agent isolation.
+ *
+ * `isolation` is an OMP-owned stdio option; the raw loaders reject it on
+ * remote transports. The transport check here is defense in depth so a remote
+ * config that somehow carries the key is never mistaken for a private stdio
+ * instance.
+ */
+function isAgentIsolated(config: MCPServerConfig): boolean {
+	const isolation = (config as MCPServerConfig & { isolation?: unknown }).isolation;
+	return isolation === "agent" && (config.type === undefined || config.type === "stdio");
+}
+
+/** Reject an acquisition with an `AbortError`, preserving an abort reason already of that name. */
+function throwAcquisitionAbort(signal: AbortSignal | undefined): never {
+	const reason = signal?.reason;
+	if (reason instanceof Error && reason.name === "AbortError") throw reason;
+	throw new DOMException("MCP agent scope acquisition aborted", "AbortError");
 }
 
 /**
@@ -287,6 +310,32 @@ function isAbortedHandshake(signal: AbortSignal, error: unknown): boolean {
  * run on the main thread's manager, so connections and server processes stay single-owner.
  */
 export interface MCPManagerApi {
+	/**
+	 * Changes whenever the tools visible through this view may have changed.
+	 * A worker uses it to skip re-fetching views that cannot have changed.
+	 */
+	readonly toolViewsRevision: number;
+	/**
+	 * Acquire an independently owned view for one live agent session.
+	 *
+	 * The view merges this manager's shared servers with private instances of
+	 * every server opted into per-agent isolation. Each call returns a new
+	 * handle, and a scope derives siblings from its canonical root rather than
+	 * from its own private instances. With no opted-in definitions the new view
+	 * creates no connections and delegates entirely to this manager, preserving
+	 * shared behavior while still allowing a later opt-in to be reconciled into
+	 * the live view.
+	 *
+	 * `signal` aborts startup only: the acquisition rejects with its abort
+	 * reason and closes every private instance it started. A resolved scope's
+	 * later lifetime is owned by its caller.
+	 */
+	createAgentScope(signal?: AbortSignal): Promise<MCPManagerApi>;
+	/**
+	 * Close the private instances and listeners this view owns. Idempotent;
+	 * the root manager's implementation is a no-op.
+	 */
+	disposeAgentScope(): Promise<void>;
 	/**
 	 * Tools `scope` sees (omitted: the owning session). A tool a server adds
 	 * while a call to it runs reaches a session only once that session's own
@@ -477,6 +526,22 @@ export class MCPManager implements MCPManagerApi {
 	#scopedTools = new Map<string, Map<string, Set<MCPToolScope>>>();
 	/** Bumped whenever any session's view of the tools may have changed; starts above a worker's empty cache (0). */
 	#toolViewsRevision = 1;
+	/** Live owner-bound views; root shutdown closes their private instances. */
+	#agentScopes = new Set<MCPAgentScope>();
+	/** Isolated server names last published to views, retained across a root reset. */
+	#agentIsolationNames = new Set<string>();
+	/** Settles when the latest discovery's configs are loaded, so a scope can start while connections are pending. */
+	#agentDefinitionsReady: Promise<void> = Promise.resolve();
+	/** Whether {@link #agentIsolationNames} reflects a completed definition load rather than a reset gap. */
+	#agentDefinitionsAvailable = false;
+	/** Serializes child-scope reconciliation with root connect/disconnect/reset. */
+	#agentScopeSyncTail: Promise<void> = Promise.resolve();
+	/** Bumped on root reset so an acquisition racing it cannot leave a private process behind. */
+	#agentScopeEpoch = 0;
+	/** Bumped whenever the published isolated set changes, so a queued stale reconcile stands down. */
+	#agentIsolationRevision = 0;
+	/** Raw notification fanout for child scopes, separate from the owner listener buffer. */
+	#agentScopeNotificationListeners = new Set<(serverName: string, method: string, params: unknown) => void>();
 
 	constructor(
 		private cwd: string,
@@ -736,6 +801,7 @@ export class MCPManager implements MCPManagerApi {
 	setNotificationsEnabled(enabled: boolean): void {
 		const wasEnabled = this.#notificationsEnabled;
 		this.#notificationsEnabled = enabled;
+		for (const scope of this.#agentScopes) scope.setNotificationsEnabled(enabled);
 		if (enabled === wasEnabled) return;
 
 		this.#notificationsEpoch += 1;
@@ -769,11 +835,13 @@ export class MCPManager implements MCPManagerApi {
 	 */
 	setAuthStorage(authStorage: AuthStorage): void {
 		this.#authStorage = authStorage;
+		for (const scope of this.#agentScopes) scope.setAuthStorage(authStorage);
 	}
 
 	/** Set the callback used to complete OAuth after a tool-level auth challenge. */
 	setAuthHandler(handler: MCPAuthHandler | undefined): void {
 		this.#authHandler = handler;
+		for (const scope of this.#agentScopes) scope.setAuthHandler(handler);
 	}
 
 	/**
@@ -788,6 +856,8 @@ export class MCPManager implements MCPManagerApi {
 
 	async #discoverAndConnect(options?: MCPDiscoverOptions): Promise<MCPLoadResult> {
 		this.#discoverOptions = options ? { ...options } : undefined;
+		const definitionsReady = Promise.withResolvers<void>();
+		this.#agentDefinitionsReady = definitionsReady.promise;
 		let loadedConfigs: LoadMCPConfigsResult;
 		try {
 			loadedConfigs = await this.loadConfigs(this.cwd, {
@@ -797,6 +867,7 @@ export class MCPManager implements MCPManagerApi {
 				extensionRoots: options?.extensionRoots,
 			});
 		} catch (error) {
+			definitionsReady.resolve();
 			const message = error instanceof Error ? error.message : String(error);
 			this.#startupServers.add(".mcp.json");
 			options?.onStatus?.({ type: "failed", serverName: ".mcp.json", error: message });
@@ -804,8 +875,14 @@ export class MCPManager implements MCPManagerApi {
 			throw error;
 		}
 		const { configs, exaApiKeys, sources } = loadedConfigs;
-		const result = await this.connectServers(configs, sources, options?.onStatus, options?.startupTimeoutMs);
+		// Start connecting before resolving: connectServers records every config
+		// synchronously, so a scope created while startup is still pending sees
+		// the full opted-in subset instead of an empty one.
+		const connections = this.connectServers(configs, sources, options?.onStatus, options?.startupTimeoutMs);
+		definitionsReady.resolve();
+		const result = await connections;
 		result.exaApiKeys = exaApiKeys;
+		await this.#scheduleAgentScopeSync();
 		return result;
 	}
 
@@ -817,7 +894,7 @@ export class MCPManager implements MCPManagerApi {
 	reconcileBrowserFilter(enabled: boolean): Promise<void> {
 		const reconcile = this.#browserFilterMutationTail.then(() => this.#applyBrowserFilter(enabled));
 		this.#browserFilterMutationTail = reconcile.catch(() => undefined);
-		return reconcile;
+		return reconcile.then(() => this.#scheduleAgentScopeSync());
 	}
 
 	/**
@@ -829,7 +906,7 @@ export class MCPManager implements MCPManagerApi {
 	reconcileProjectConfig(enabled: boolean): Promise<void> {
 		const reconcile = this.#browserFilterMutationTail.then(() => this.#applyProjectConfig(enabled));
 		this.#browserFilterMutationTail = reconcile.catch(() => undefined);
-		return reconcile;
+		return reconcile.then(() => this.#scheduleAgentScopeSync());
 	}
 
 	async #applyProjectConfig(enabled: boolean): Promise<void> {
@@ -1099,6 +1176,12 @@ export class MCPManager implements MCPManagerApi {
 			this.#startupUpdates.set(name, startupUpdate);
 		}
 
+		// Every definition this connect knows about is recorded now, including
+		// servers still handshaking. Publish the isolated subset before any
+		// connection settles so a live scope never sees a root instance for it.
+		this.#agentDefinitionsAvailable = true;
+		this.#publishAgentIsolation();
+
 		// Notify about servers we're connecting to, including configs that fail fast.
 		if (statusServerNames.length > 0) {
 			notify({ type: "connecting", serverNames: statusServerNames });
@@ -1176,6 +1259,7 @@ export class MCPManager implements MCPManagerApi {
 		}
 
 		allowBackgroundLogging = true;
+		void this.#scheduleAgentScopeSync();
 
 		return {
 			tools: this.getTools(),
@@ -1337,13 +1421,28 @@ export class MCPManager implements MCPManagerApi {
 		}
 
 		// Buffer for late-attaching subscribers when no listener exists yet.
-		if (this.#notificationListeners.size === 0) {
+		const buffered = this.#notificationListeners.size === 0;
+		if (buffered) {
 			this.#pendingNotifications.push({ server: serverName, method, params });
 			if (this.#pendingNotifications.length > NOTIFICATION_BUFFER_CAP) {
 				this.#pendingNotifications.shift();
 			}
-			return;
 		}
+
+		// Child scopes see raw frames without consuming the owner's startup buffer.
+		for (const listener of this.#agentScopeNotificationListeners) {
+			try {
+				listener(serverName, method, params);
+			} catch (error) {
+				logger.debug("MCP agent scope notification listener threw", {
+					path: `mcp:${serverName}`,
+					method,
+					error,
+				});
+			}
+		}
+
+		if (buffered) return;
 
 		for (const listener of this.#notificationListeners) {
 			try {
@@ -1387,6 +1486,203 @@ export class MCPManager implements MCPManagerApi {
 			const scopes = this.#scopedTools.get(tool.mcpServerName ?? "")?.get(tool.mcpToolName ?? "");
 			return scopes === undefined || scopes.has(scope);
 		});
+	}
+
+	/**
+	 * Acquire a new owner-bound view. No opted-in definitions means the view
+	 * creates no connections and delegates entirely to this manager; it still
+	 * stays subscribed so a later opt-in can be reconciled into it. Every call
+	 * returns a new handle, never this root instance.
+	 */
+	async createAgentScope(signal?: AbortSignal): Promise<MCPManagerApi> {
+		await untilAborted(signal, () => this.#agentDefinitionsReady);
+		if (signal?.aborted) throwAcquisitionAbort(signal);
+		const epoch = this.#agentScopeEpoch;
+		const authoritative = this.#agentDefinitionsAvailable;
+		const definitions = authoritative ? this.#isolationDefinitions() : new Map<string, MCPAgentIsolationDefinition>();
+		const isolatedNames = authoritative ? new Set(definitions.keys()) : new Set(this.#agentIsolationNames);
+		if (authoritative) this.#agentIsolationNames = new Set(isolatedNames);
+		const isolationRevision = this.#agentIsolationRevision;
+		const scope = new MCPAgentScope(this, isolatedNames, isolationRevision);
+		this.#agentScopes.add(scope);
+		let aborted = false;
+		const onAbort = () => {
+			aborted = true;
+			// Reclaim any private handshake started for this acquisition, then
+			// unregister the half-built handle; late success is discarded below.
+			scope.abortPendingPrivate();
+			void scope.disposeAgentScope().catch(() => undefined);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			await untilAborted(signal, () => scope.start(definitions, authoritative, signal, isolationRevision));
+		} catch (error) {
+			await scope.disposeAgentScope();
+			if (signal?.aborted) {
+				if (error instanceof Error && error.name === "AbortError") throw error;
+				throwAcquisitionAbort(signal);
+			}
+			throw error;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+		if (aborted || signal?.aborted) {
+			await scope.disposeAgentScope();
+			throwAcquisitionAbort(signal);
+		}
+		// A root reset that landed while the private subset was starting must not
+		// leave it running; the next root discovery reconciles the live view.
+		if (this.#agentScopeEpoch !== epoch) await scope.reset();
+		return scope;
+	}
+
+	/** The root owns no private instances; only acquired scopes do. */
+	disposeAgentScope(): Promise<void> {
+		return Promise.resolve();
+	}
+
+	/**
+	 * Start a private manager for one scope's isolated subset. The manager is
+	 * not installed as the process global and uses no persistent tool cache.
+	 * Startup failures are returned, not thrown, so the caller decides whether
+	 * they are fatal (new scope) or partial (reload reconcile).
+	 * @internal
+	 */
+	async createPrivateManager(
+		definitions: ReadonlyMap<string, MCPAgentIsolationDefinition>,
+		onCreated?: (manager: MCPManager) => void,
+		signal?: AbortSignal,
+		options?: { waitForStartup?: boolean; startupTimeoutMs?: number },
+	): Promise<MCPAgentPrivateStartup> {
+		const manager = new MCPManager(this.cwd, null, this.loadConfigs, this.reconnectPolicy);
+		if (this.#authStorage) manager.setAuthStorage(this.#authStorage);
+		if (this.#authHandler) manager.setAuthHandler(this.#authHandler);
+		manager.setNotificationsEnabled(this.#notificationsEnabled);
+		const configs: Record<string, MCPServerConfig> = {};
+		const sources: Record<string, SourceMeta> = {};
+		for (const [name, definition] of definitions) {
+			configs[name] = definition.config;
+			if (definition.source) sources[name] = definition.source;
+		}
+		// Published before connecting so a root reset or scope disposal can abort
+		// a handshake that is still inside the startup window.
+		onCreated?.(manager);
+		// An abort before the first request must not start anything; one during
+		// the handshake aborts the private manager's own epoch, so a stalled
+		// `initialize` cannot outlive the acquisition.
+		if (signal?.aborted) return { manager, errors: new Map() };
+		const onAbort = () => {
+			void manager.disconnectAll().catch(() => undefined);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			const result = await manager.connectServers(
+				configs,
+				sources,
+				undefined,
+				options?.startupTimeoutMs ?? this.#discoverOptions?.startupTimeoutMs,
+			);
+			const errors = new Map(result.errors);
+			if (options?.waitForStartup && !signal?.aborted) {
+				// A pending handshake past the root's fast window is not success: an
+				// acquisition waits for the real outcome so a later failure rejects it.
+				const status = await manager.waitForStartup(0);
+				for (const name of status.connected) errors.delete(name);
+				for (const failure of status.failed) {
+					if (!errors.has(failure.name)) errors.set(failure.name, failure.error);
+				}
+				for (const name of status.pending) {
+					if (!errors.has(name)) errors.set(name, "MCP server did not finish starting");
+				}
+				const connected = new Set(status.connected);
+				for (const name of definitions.keys()) {
+					if (!connected.has(name) && !errors.has(name)) {
+						errors.set(name, "MCP server did not finish starting");
+					}
+				}
+			}
+			return { manager, errors };
+		} catch (error) {
+			await manager.disconnectAll().catch(() => undefined);
+			throw error;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+	}
+
+	/** Startup window a scope's private manager uses, matching the root's discovery. @internal */
+	get agentStartupTimeoutMs(): number | undefined {
+		return this.#discoverOptions?.startupTimeoutMs;
+	}
+
+	/**
+	 * Subscribe a child scope to raw notification frames without draining the
+	 * root's startup buffer into it (that buffer belongs to the owner session).
+	 * @internal
+	 */
+	subscribeAgentScopeNotifications(
+		listener: (serverName: string, method: string, params: unknown) => void,
+	): () => void {
+		this.#agentScopeNotificationListeners.add(listener);
+		return () => {
+			this.#agentScopeNotificationListeners.delete(listener);
+		};
+	}
+
+	/** Drop a closed scope from root tracking. @internal */
+	unregisterAgentScope(scope: MCPAgentScope): void {
+		this.#agentScopes.delete(scope);
+	}
+
+	/** Opted-in effective definitions, including servers whose startup is still pending. */
+	#isolationDefinitions(): Map<string, MCPAgentIsolationDefinition> {
+		const definitions = new Map<string, MCPAgentIsolationDefinition>();
+		const names = new Set<string>([
+			...this.#serverConfigs.keys(),
+			...this.#sources.keys(),
+			...this.#connections.keys(),
+			...this.#pendingConnections.keys(),
+		]);
+		for (const name of names) {
+			const config = this.getServerConfig(name);
+			if (!config || !isAgentIsolated(config)) continue;
+			definitions.set(name, { config, source: this.getSource(name) });
+		}
+		return definitions;
+	}
+
+	/**
+	 * Publish the current isolated names synchronously, before any private
+	 * handshake starts. Views hide the root's isolated instances immediately, so
+	 * a connect or disconnect never opens a window where they borrow one.
+	 */
+	#publishAgentIsolation(): void {
+		if (!this.#agentDefinitionsAvailable) return;
+		this.#agentIsolationNames = new Set(this.#isolationDefinitions().keys());
+		const revision = ++this.#agentIsolationRevision;
+		for (const scope of [...this.#agentScopes]) scope.retainIsolation(this.#agentIsolationNames, revision);
+	}
+
+	#scheduleAgentScopeSync(): Promise<void> {
+		if (this.#agentScopes.size === 0) return Promise.resolve();
+		const run = this.#agentScopeSyncTail.then(() => this.#syncAgentScopes());
+		this.#agentScopeSyncTail = run.catch(() => undefined);
+		return run;
+	}
+
+	async #syncAgentScopes(): Promise<void> {
+		if (!this.#agentDefinitionsAvailable) return;
+		const definitions = this.#isolationDefinitions();
+		this.#agentIsolationNames = new Set(definitions.keys());
+		const revision = ++this.#agentIsolationRevision;
+		const scopes = [...this.#agentScopes];
+		for (const scope of scopes) scope.retainIsolation(this.#agentIsolationNames, revision);
+		const results = await Promise.allSettled(scopes.map(scope => scope.reconcile(definitions, revision)));
+		for (const result of results) {
+			if (result.status === "rejected") {
+				logger.error("MCP agent scope reconcile failed", { error: result.reason });
+			}
+		}
 	}
 
 	/**
@@ -1492,6 +1788,8 @@ export class MCPManager implements MCPManagerApi {
 		const connection = this.#connections.get(name);
 		if (connection) connection.config = config;
 		this.#forgetLostServer(name);
+		this.#publishAgentIsolation();
+		void this.#scheduleAgentScopeSync();
 		return this.#pendingReconnections.get(name);
 	}
 
@@ -1631,12 +1929,30 @@ export class MCPManager implements MCPManagerApi {
 
 		// Notify prompt consumers so stale commands are cleared
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
+
+		// The server is no longer an effective definition: hide its private
+		// instance immediately, then close it during reconcile.
+		this.#publishAgentIsolation();
+		void this.#scheduleAgentScopeSync();
 	}
 
 	/**
 	 * Disconnect from all servers.
 	 */
 	async disconnectAll(): Promise<void> {
+		// Child private instances go first: no private process may outlive the
+		// root's connections, and no live view may keep pointing at a closed
+		// source. Scopes stay subscribed; a later discovery reconciles them.
+		this.#agentDefinitionsAvailable = false;
+		this.#agentScopeEpoch++;
+		const scopes = [...this.#agentScopes];
+		// Invalidate every in-flight reconcile and queue its close BEFORE waiting on
+		// the root sync tail. Otherwise a reconcile resuming from a replacement
+		// `disconnectServer` await would still see its old epoch and start the
+		// replacement on the private manager's fresh connectAbort, hanging shutdown.
+		const resets = scopes.map(scope => scope.reset());
+		await Promise.allSettled([this.#agentScopeSyncTail, ...resets]);
+
 		// Invalidate any in-flight reconnection attempts that outlive this call.
 		// They captured the old epoch; after increment they'll detect staleness.
 		// A scheduled retry that fired during the teardown below would sample

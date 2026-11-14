@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Stdio MCP servers can opt into `"isolation": "agent"` for a private instance per live agent or subagent, while other servers retain shared connections.
+
 ## [18.18.8] - 2026-11-11
 
 ### Changed

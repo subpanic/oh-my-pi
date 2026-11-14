@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { prompt, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
+import { logger, prompt, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 import backgroundTanDispatchPrompt from "../../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import tanContextSwitchPrompt from "../../prompts/system/tan-context-switch.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
@@ -11,7 +11,7 @@ import type { AgentSession } from "../../session/agent-session";
 import { BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE } from "../../session/messages";
 import { isHiddenUserCompanion } from "../../session/queued-messages";
 import { SessionManager } from "../../session/session-manager";
-import { createSubagentSettings, followMCPTools } from "../../task/executor";
+import { createSubagentSettings, followMCPTools, type MCPToolFollower } from "../../task/executor";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
 import type { InteractiveModeContext } from "../types";
 
@@ -151,13 +151,23 @@ export class TanCommandController {
 					if (signal.aborted) throw new Error("Aborted before execution");
 
 					let clone: AgentSession | undefined;
-					// Mint proxies at clone time (not dispatch time) and subscribe first,
-					// so the clone follows MCP reloads for its whole run. A fork of the owner
-					// starts from the owner's view, so it renders the owner's exact tools.
-					const mcpFollower = mcpManager
-						? followMCPTools(mcpManager, { scope: cloneManager.getSessionId() })
-						: undefined;
+					// A tan is a live child: acquire its owner-bound MCP view before
+					// minting proxies, and tie that scope's lifetime to the clone.
+					let mcpLease: sdk.AgentMCPManagerLease | undefined;
+					let mcpLeaseTransferred = false;
+					let mcpFollower: MCPToolFollower | undefined;
 					try {
+						mcpLease = mcpManager ? await sdk.acquireAgentMCPManager(mcpManager, signal) : undefined;
+						if (signal.aborted) throw new Error("Aborted before execution");
+						const ownedMCPLease = mcpLease;
+						const scopedMCPManager = ownedMCPLease?.manager;
+						const disposeMCPManager = ownedMCPLease ? () => ownedMCPLease.dispose() : undefined;
+						// Mint proxies at clone time (not dispatch time) and subscribe first,
+						// so the clone follows MCP reloads for its whole run. The owner-bound
+						// scope starts from the owner's view, so it renders the same tools.
+						mcpFollower = scopedMCPManager
+							? followMCPTools(scopedMCPManager, { scope: cloneManager.getSessionId() })
+							: undefined;
 						try {
 							const created = await sdk.createAgentSession({
 								cwd,
@@ -176,7 +186,11 @@ export class TanCommandController {
 								authStorage: modelRegistry.authStorage,
 								settings,
 								hasUI: false,
-								enableMCP: false,
+								// Only enable MCP when a manager was actually acquired: with
+								// MCP off, the SDK must not start discovery for this clone.
+								enableMCP: scopedMCPManager !== undefined,
+								mcpManager: scopedMCPManager,
+								disposeMCPManager,
 								mcpTools: mcpFollower?.proxyTools(),
 								mcpToolScope: mcpFollower?.scope,
 								enableLsp,
@@ -198,6 +212,8 @@ export class TanCommandController {
 								parentMnemopiSessionState,
 							});
 							clone = created.session;
+							// The clone's session now owns the scope through its disposer.
+							mcpLeaseTransferred = true;
 							await clone.setActiveToolPresentation(toolNames, mountedToolNames);
 						} catch (error) {
 							mcpFollower?.dispose();
@@ -331,6 +347,19 @@ export class TanCommandController {
 								agentRegistry.detachSession(cloneId);
 							}
 						}
+						// A clone-less failure (acquire, follower, or session startup) still
+						// owns its scope; a created clone already closed it in dispose.
+						if (mcpLease && !mcpLeaseTransferred) {
+							try {
+								await mcpLease.dispose();
+							} catch (error) {
+								logger.warn("Tan MCP scope cleanup failed", {
+									cloneId,
+									error: error instanceof Error ? error.message : String(error),
+								});
+							}
+						}
+						mcpFollower?.dispose();
 					}
 				},
 				{ ownerId, agentId: cloneId },

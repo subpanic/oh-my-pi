@@ -838,8 +838,21 @@ export interface CreateAgentSessionOptions {
 	 * true.
 	 */
 	enableMCP?: boolean;
-	/** Existing MCP manager to reuse when MCP is enabled (skips discovery, propagates to toolSession). */
+	/**
+	 * Existing MCP manager to reuse when MCP is enabled (skips discovery,
+	 * propagates to toolSession). A child session passes its owner-bound scope
+	 * here and must pair it with {@link disposeMCPManager}.
+	 */
 	mcpManager?: MCPManagerApi;
+	/**
+	 * Release an owner-bound manager acquired for this session (see
+	 * {@link acquireAgentMCPManager}). Awaited by session disposal after the
+	 * session's MCP listeners are dropped; omit it for a shared or parent-owned
+	 * manager, which this session must never disconnect. If construction fails
+	 * before a session exists, the caller still owns the manager and must call
+	 * this itself.
+	 */
+	disposeMCPManager?: () => Promise<void>;
 	/**
 	 * MCP tools minted from a parent's shared manager (subagent proxies). They
 	 * register as manager-owned MCP tools — active from the start and replaced
@@ -1054,6 +1067,52 @@ export interface CreateAgentSessionResult {
 	eventBus: EventBus;
 	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
 	subagentEventBus?: EventBus;
+}
+
+/**
+ * One owner-bound MCP manager acquired for a live child session.
+ *
+ * The session and every MCP proxy it mints must use {@link manager}; a failed
+ * private server must surface rather than falling back to the parent or
+ * process-global manager. A scope with no opted-in effective definitions
+ * creates no private connections and delegates shared servers entirely to its
+ * root, so acquisition stays zero-process when nothing is isolated; it stays
+ * subscribed so a later reload that enables isolation reconciles a private
+ * instance into the live child.
+ */
+export interface AgentMCPManagerLease {
+	/** Manager the child session owns for its whole life. */
+	readonly manager: MCPManagerApi;
+	/** Idempotent close of this scope's private instances and listeners. */
+	dispose(): Promise<void>;
+}
+
+/**
+ * Acquire the private MCP instance set of one child session from `source`.
+ *
+ * `source` is the spawning session's manager (a root or an owner-bound scope);
+ * `source.createAgentScope()` always returns a NEW scope owned by this
+ * acquisition. A scope resolves against its canonical root, never against the
+ * invoking scope's private instances. Acquisition happens before any tool view
+ * or proxy is minted. `signal` cancels a private startup still in flight; an
+ * aborted acquisition rejects without yielding a lease. Disposal is memoized so
+ * a late teardown and an explicit failure cleanup cannot close a newer handle
+ * through the old one.
+ */
+export async function acquireAgentMCPManager(
+	source: MCPManagerApi,
+	signal?: AbortSignal,
+): Promise<AgentMCPManagerLease> {
+	signal?.throwIfAborted();
+	const manager = await source.createAgentScope(signal);
+	let disposal: Promise<void> | undefined;
+	return {
+		manager,
+		dispose() {
+			disposal ??= manager.disposeAgentScope();
+			return disposal;
+		},
+	};
 }
 
 export type DialectFormat = "auto" | "native" | Dialect;
@@ -5111,10 +5170,25 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const advisorContextPrompt = formatAdvisorContextPrompt(contextFiles);
 		// Owned only when this session created the manager; subagents receive a
 		// parent's manager via `options.mcpManager` and MUST NOT disconnect it.
+		// An owner-bound child scope supplies its own disposer instead, so both
+		// kinds of session-owned MCP manager close with this session.
 		// Advisor spend recorded before this resume is restored off the critical
 		// path below (issue #9553): a large advisor transcript would otherwise
 		// block createAgentSession for tens of seconds while the whole file is
 		// streamed and parsed on the main thread.
+		const ownedMcpManagerForDispose = ownedMcpManager;
+		const disconnectOwnedMcpManager =
+			ownedMcpManagerForDispose || options.disposeMCPManager
+				? async () => {
+						const disposals: Promise<void>[] = [];
+						if (ownedMcpManagerForDispose) disposals.push(ownedMcpManagerForDispose.disconnectAll());
+						if (options.disposeMCPManager) disposals.push(options.disposeMCPManager());
+						const results = await Promise.allSettled(disposals);
+						for (const result of results) {
+							if (result.status === "rejected") throw result.reason;
+						}
+					}
+				: undefined;
 		session = new AgentSession({
 			cacheWarmer,
 			costGate: options.costGate,
@@ -5170,7 +5244,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			reconcileBrowserMcpFilter: mcpManager
 				? async enabled => {
 						await mcpManager.reconcileBrowserFilter(enabled);
-						return mcpManager.getTools();
+						return mcpManager.getTools(options.mcpToolScope);
 					}
 				: undefined,
 			memoryEnabled: !restrictToolNames,
@@ -5229,7 +5303,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			setMcpServerInstructionsSource: source => {
 				hostMcpServerInstructions = source;
 			},
-			disconnectOwnedMcpManager: ownedMcpManager ? () => ownedMcpManager.disconnectAll() : undefined,
+			disconnectOwnedMcpManager,
 			ttsrManager,
 			obfuscator,
 			agentId: resolvedAgentId,

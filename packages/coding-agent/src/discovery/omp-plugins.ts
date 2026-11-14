@@ -21,7 +21,7 @@ import { logger, parseFrontmatter, tryParseJson } from "@oh-my-pi/pi-utils";
 import { registerProvider } from "../capability";
 import { readDirEntries, readFile } from "../capability/fs";
 import { type Hook, hookCapability } from "../capability/hook";
-import { type MCPServer, mcpCapability } from "../capability/mcp";
+import { inspectMCPAgentIsolation, type MCPServer, mcpCapability } from "../capability/mcp";
 import { type Prompt, promptCapability } from "../capability/prompt";
 import { type Rule, ruleCapability } from "../capability/rule";
 import { type Skill, skillCapability } from "../capability/skill";
@@ -280,6 +280,7 @@ interface RawMcpServer {
 	timeout?: number;
 	requestIdFormat?: unknown;
 	instructions?: unknown;
+	isolation?: unknown;
 	command?: string;
 	args?: string[];
 	env?: Record<string, string>;
@@ -324,7 +325,40 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 		for (const [serverName, serverCfg] of Object.entries(servers)) {
 			if (!serverCfg || typeof serverCfg !== "object" || Array.isArray(serverCfg)) continue;
 			const cfg = serverCfg as RawMcpServer;
+			// Isolation is OMP-owned and stdio-only. Check it before endpoint
+			// validation and reserve the name on rejection: a bad opt-in must not
+			// let a same-named lower-priority server silently launch shared, even
+			// when the higher-priority entry also lacks a usable endpoint.
+			const isolationCheck = inspectMCPAgentIsolation(cfg.isolation, {
+				transport: cfg.type,
+				command: cfg.command,
+				url: cfg.url,
+			});
+			if (isolationCheck.error !== undefined) {
+				warnings.push(`[omp-plugins] Skipping MCP server "${serverName}" in ${mcpPath}: ${isolationCheck.error}`);
+				items.push({
+					name: serverName,
+					enabled: false,
+					isolationError: `[omp-plugins] MCP server "${serverName}" in ${mcpPath}: ${isolationCheck.error}`,
+					_source: createSourceMeta(PROVIDER_ID, mcpPath, root.level),
+				});
+				continue;
+			}
+			const isolation = isolationCheck.isolation;
 			if (typeof cfg.command !== "string" && typeof cfg.url !== "string") {
+				if (isolation === "agent") {
+					// A valid opt-in still needs an endpoint; reserve the name so the
+					// rejected isolated definition cannot downgrade to a shared one.
+					const error = 'isolation "agent" requires a command or url';
+					warnings.push(`[omp-plugins] Skipping MCP server "${serverName}" in ${mcpPath}: ${error}`);
+					items.push({
+						name: serverName,
+						enabled: false,
+						isolationError: `[omp-plugins] MCP server "${serverName}" in ${mcpPath}: ${error}`,
+						_source: createSourceMeta(PROVIDER_ID, mcpPath, root.level),
+					});
+					continue;
+				}
 				warnings.push(`[omp-plugins] Skipping MCP server "${serverName}" in ${mcpPath}: missing command or url`);
 				continue;
 			}
@@ -352,6 +386,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				...(cfg.timeout !== undefined && { timeout: cfg.timeout }),
 				...(requestIdFormat !== undefined && { requestIdFormat }),
 				...(instructions !== undefined && { instructions }),
+				...(isolation === "agent" && { isolation }),
 				...(rooted.command !== undefined && { command: rooted.command }),
 				...(cfg.args !== undefined && { args: cfg.args }),
 				...(cfg.env !== undefined && { env: cfg.env }),

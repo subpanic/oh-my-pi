@@ -137,6 +137,7 @@ Optional:
 - `args?: string[]`
 - `env?: Record<string, string>`
 - `cwd?: string`
+- `isolation?: "agent"` — opt into a private stdio server instance per live agent; omitted keeps parent/subagent connection sharing.
 
 Example:
 
@@ -153,6 +154,31 @@ Example:
 ```
 
 This follows the official Filesystem MCP server package (`@modelcontextprotocol/server-filesystem`).
+
+#### Per-agent stdio instances
+
+Add `"isolation": "agent"` to a server's definition when its state must not be shared by parallel agents. The root retains its own instance; each subagent, nested subagent, and `/tan` clone gets a separate instance of that server. Servers without this option continue using the existing shared connections. Tool names remain unchanged.
+
+```json
+{
+	"mcpServers": {
+		"stateful-tool": {
+			"type": "stdio",
+			"command": "/absolute/path/to/mcp-server",
+			"isolation": "agent"
+		}
+	}
+}
+```
+
+The connection belongs to the live agent session, not an individual call or turn. Idle follow-ups retain it; disposal, committed parking, explicit kill, worker loss, and root shutdown close its private instances. Revival and MCP reload/reconnection create fresh instances: server-local session IDs and in-memory state are not restored from the agent transcript.
+
+Private initial startup waits for that instance's tool handshake and honors cancellation and MCP request timeouts. Failure never falls back to the parent's instance. Tools, resources, server instructions, and notifications use the owning agent's instance.
+
+This OMP-specific option is read from native configuration, root fallback files, and OMP extension packages. Other tool formats do not acquire this meaning. HTTP/SSE usage and values other than `"agent"` are rejected; a rejected owned definition reserves its name so a lower-priority shared definition cannot silently replace it. Put the option on the winning complete definition, not a lower-priority partial override.
+
+Isolation is process/state ownership, not a sandbox: instances still use the configured credentials, environment, working directory, and filesystem. Opting in increases subprocess/resource use. Leave servers shared when their semantics require shared state.
+
 
 ### `http` transport
 
@@ -494,7 +520,7 @@ OMP loads providers in descending priority. The MCP-capable order is:
 9. VS Code
 10.   root `mcp.json` / `.mcp.json` fallback files
 
-Across providers, the first definition wins. Duplicate names are not merged; OpenCode's internal config layers are the exception described above. A differently named definition is also shadowed when its transport, endpoint/command inputs, auth, and request-id mode are equivalent to a higher-priority definition.
+Across providers, the first definition wins. Duplicate names are not merged; OpenCode's internal config layers are the exception described above. A differently named definition is also shadowed when its transport, endpoint/command inputs, auth, request-id mode, and isolation policy are equivalent to a higher-priority definition.
 
 Within OMP native config, project `.omp/mcp.json` precedes `.omp/.mcp.json`, then the active profile's user `mcp.json` and `.mcp.json`. Root fallback `mcp.json` precedes root `.mcp.json`. In practice:
 

@@ -5,7 +5,7 @@
  */
 
 import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
-import { mcpCapability } from "../capability/mcp";
+import { mcpCapability, readMCPAgentIsolation, readMCPTransport, resolveMCPTransport } from "../capability/mcp";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
@@ -55,6 +55,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 			type: "stdio" as const,
 			command: server.command ?? "",
 		};
+		if (server.isolation) config.isolation = server.isolation;
 		if (server.args) config.args = server.args;
 		if (server.env) config.env = server.env;
 		if (server.envPolicy) config.envPolicy = server.envPolicy;
@@ -139,6 +140,11 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	// differently-named enabled server — otherwise the disabled alias would be
 	// removed downstream and starve the surviving connection.
 	const suppressServer = (server: MCPServer & { _source: SourceMeta }): boolean => {
+		// A rejected isolation opt-in exists only to reserve its name, so it is
+		// never launched and never force-enabled. Suppressing it (rather than
+		// dropping it in the provider) keeps a same-named lower-priority entry
+		// from silently starting shared in its place.
+		if (server.isolationError !== undefined) return true;
 		if (disabledServers.has(server.name)) return true;
 		if (server.enabled === false && !forcedEnabled.has(server.name)) return true;
 		return false;
@@ -362,6 +368,28 @@ export function validateServerConfig(name: string, config: MCPServerConfig): str
 		}
 	} else {
 		errors.push(`Server "${name}": unknown server type "${serverType}"`);
+	}
+
+	// Isolation belongs to the stdio config type, but a parsed JSON config can
+	// still carry the key on any transport. Inspect the runtime own property so
+	// the type boundary and this fail-closed check agree.
+	const isolation = readMCPAgentIsolation("isolation" in config ? config.isolation : undefined);
+	if (isolation === "invalid") {
+		errors.push(`Server "${name}": "isolation" must be "agent" when set`);
+	} else if (isolation === "agent") {
+		// An explicit but unknown transport is not inferable as stdio; only an
+		// absent type may fall back to command/url inference.
+		const explicitTransport = readMCPTransport(config.type);
+		const transport =
+			explicitTransport === "absent"
+				? resolveMCPTransport({
+						command: "command" in config ? config.command : undefined,
+						url: "url" in config ? config.url : undefined,
+					})
+				: explicitTransport;
+		if (transport !== "stdio") {
+			errors.push(`Server "${name}": isolation "agent" is only supported for stdio servers`);
+		}
 	}
 
 	return errors;

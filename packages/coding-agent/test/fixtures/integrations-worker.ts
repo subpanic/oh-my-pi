@@ -5,7 +5,7 @@ import type { CustomTool, CustomToolContext } from "../../src/extensibility/cust
 import { bindPreparedExtensions } from "../../src/extensibility/extensions/loader";
 import type { PreparedExtension } from "../../src/extensibility/extensions/types";
 import { type LocalProtocolOptions, resolveLocalRoot } from "../../src/internal-urls/local-protocol";
-import { MCPManager } from "../../src/mcp/manager";
+import { MCPManager, type MCPManagerApi } from "../../src/mcp/manager";
 import { SessionManager } from "../../src/session/session-manager";
 import { createMCPProxyTools, type ExecutorOptions } from "../../src/task/executor";
 import { setCurrentThreadId } from "../../src/thread/identity";
@@ -24,10 +24,53 @@ export interface ToolCallOutcome {
 	errorName?: string;
 }
 
+/** One worker-held owner-bound scope as the worker reads it. */
+export interface WorkerScopeSnapshot {
+	servers: string[];
+	tools: string[];
+	revision: number;
+}
+
+/** One server notification as a worker listener receives it. */
+export interface WorkerNotification {
+	serverName: string;
+	method: string;
+	params: unknown;
+}
+
 /** Worker-side operations the test drives; each crosses to main as an async function. */
 export interface IntegrationsProbe {
 	/** What the worker's `MCPManager` statics report. */
 	mcpGlobal(): Promise<{ available: boolean; remote: boolean; servers: string[]; tools: string[] }>;
+	/** Acquire an independently owned scope from the worker's bound root and retain it under `handleId`. */
+	mcpScopeCreate(handleId: string): Promise<WorkerScopeSnapshot>;
+	/** Start acquiring a scope but return before it resolves; the worker retains it under `handleId` when it does. */
+	mcpScopeCreateDeferred(handleId: string): Promise<void>;
+	/** Acquire a sibling scope from the canonical root through the worker-held `parentHandleId`. */
+	mcpScopeNested(parentHandleId: string, handleId: string): Promise<WorkerScopeSnapshot>;
+	/** The retained scope's current view; unlike create, does not acquire. */
+	mcpScopeSnapshot(handleId: string): Promise<WorkerScopeSnapshot>;
+	/** Call an MCP tool through the retained scope's own view, selecting the server explicitly. */
+	mcpScopeCall(
+		handleId: string,
+		serverName: string,
+		toolName: string,
+		args: Record<string, unknown>,
+	): Promise<ToolCallOutcome>;
+	/** Read an MCP resource through the retained scope and parse its JSON text. */
+	mcpScopeReadResource(handleId: string, serverName: string, uri: string): Promise<Record<string, unknown>>;
+	/** Server-provided instructions as this scope merges them. */
+	mcpScopeInstructions(handleId: string): Promise<Record<string, string>>;
+	/** The bound view's effective tool revision. */
+	mcpScopeRevision(handleId: string): Promise<number>;
+	/** Subscribe the retained scope's listener; notification frames are read with `mcpScopeLastNotification`. */
+	mcpScopeWatch(handleId: string): Promise<void>;
+	/** The last notification the retained scope's listener saw, or null. */
+	mcpScopeLastNotification(handleId: string): Promise<WorkerNotification | null>;
+	/** Dispose only the retained scope; its siblings stay live. */
+	mcpScopeDispose(handleId: string): Promise<void>;
+	/** Dispose the retained scope but keep its proxy addressable for disposed-view assertions. */
+	mcpScopeDisposeRetained(handleId: string): Promise<void>;
 	/** Each scope's MCP tool names as this worker reads them, in order, through one `RemoteMCPManager`. */
 	mcpViews(scopes: string[]): Promise<string[][]>;
 	/** Call an MCP tool through `createMCPProxyTools(MCPManager.instance())`, as a child session would. */
@@ -115,6 +158,22 @@ function workerContext(registry: ModelRegistry, onAbort: () => void): CustomTool
 
 function buildProbe(): IntegrationsProbe {
 	let unwatch: (() => void) | undefined;
+	const scopes = new Map<string, MCPManagerApi>();
+	const notificationUnsubscribes = new Map<string, () => void>();
+	const notifications = new Map<string, WorkerNotification>();
+	const requireScope = (handleId: string): MCPManagerApi => {
+		const scope = scopes.get(handleId);
+		if (!scope) throw new Error(`no retained MCP scope ${handleId}`);
+		return scope;
+	};
+	const snapshot = (scope: MCPManagerApi): WorkerScopeSnapshot => ({
+		servers: [...scope.getConnectedServers()].sort(),
+		tools: scope
+			.getTools()
+			.flatMap(tool => (tool.mcpServerName && tool.mcpToolName ? [`${tool.mcpServerName}/${tool.mcpToolName}`] : []))
+			.sort(),
+		revision: scope.toolViewsRevision,
+	});
 	return {
 		mcpGlobal: async () => {
 			const manager = MCPManager.instance();
@@ -125,10 +184,77 @@ function buildProbe(): IntegrationsProbe {
 				tools: manager?.getTools().map(tool => tool.name) ?? [],
 			};
 		},
-		mcpViews: async scopes => {
+		mcpScopeCreate: async handleId => {
 			const manager = MCPManager.instance();
 			if (!manager) throw new Error("no MCP manager in worker");
-			return scopes.map(scope => manager.getTools(scope).map(tool => tool.mcpToolName ?? ""));
+			const scope = await manager.createAgentScope();
+			scopes.set(handleId, scope);
+			return snapshot(scope);
+		},
+		mcpScopeCreateDeferred: async handleId => {
+			const manager = MCPManager.instance();
+			if (!manager) throw new Error("no MCP manager in worker");
+			// Retain after the promise settles without making the caller wait; a rejection is surfaced by the
+			// tests that await the audit, never as an unhandled rejection in this worker.
+			void manager
+				.createAgentScope()
+				.then(scope => {
+					scopes.set(handleId, scope);
+				})
+				.catch(() => {});
+		},
+		mcpScopeNested: async (parentHandleId, handleId) => {
+			const parent = requireScope(parentHandleId);
+			const scope = await parent.createAgentScope();
+			scopes.set(handleId, scope);
+			return snapshot(scope);
+		},
+		mcpScopeSnapshot: async handleId => snapshot(requireScope(handleId)),
+		mcpScopeCall: async (handleId, serverName, toolName, args) => {
+			const scope = requireScope(handleId);
+			const tool = scope
+				.getTools()
+				.find(candidate => candidate.mcpServerName === serverName && candidate.mcpToolName === toolName);
+			if (!tool?.execute) throw new Error(`no ${serverName}/${toolName} in scope ${handleId}`);
+			return runTool(tool, {} as CustomToolContext, args, undefined);
+		},
+		mcpScopeReadResource: async (handleId, serverName, uri) => {
+			const result = await requireScope(handleId).readServerResource(serverName, uri);
+			const text = result?.contents.flatMap(part => (part.text === undefined ? [] : [part.text])).join("\n") ?? "";
+			return JSON.parse(text) as Record<string, unknown>;
+		},
+		mcpScopeInstructions: async handleId => {
+			return Object.fromEntries(requireScope(handleId).getServerInstructions());
+		},
+		mcpScopeRevision: async handleId => requireScope(handleId).toolViewsRevision,
+		mcpScopeWatch: async handleId => {
+			const scope = requireScope(handleId);
+			notificationUnsubscribes.get(handleId)?.();
+			notifications.delete(handleId);
+			const unsubscribe = scope.addNotificationListener((serverName, method, params) => {
+				notifications.set(handleId, { serverName, method, params });
+			});
+			notificationUnsubscribes.set(handleId, unsubscribe);
+		},
+		mcpScopeLastNotification: async handleId => notifications.get(handleId) ?? null,
+		mcpScopeDispose: async handleId => {
+			const scope = scopes.get(handleId);
+			notificationUnsubscribes.get(handleId)?.();
+			notificationUnsubscribes.delete(handleId);
+			notifications.delete(handleId);
+			scopes.delete(handleId);
+			await scope?.disposeAgentScope();
+		},
+		mcpScopeDisposeRetained: async handleId => {
+			notificationUnsubscribes.get(handleId)?.();
+			notificationUnsubscribes.delete(handleId);
+			notifications.delete(handleId);
+			await requireScope(handleId).disposeAgentScope();
+		},
+		mcpViews: async scopesToRead => {
+			const manager = MCPManager.instance();
+			if (!manager) throw new Error("no MCP manager in worker");
+			return scopesToRead.map(scope => manager.getTools(scope).map(tool => tool.mcpToolName ?? ""));
 		},
 		mcpCall: async (registry, toolName, args, signal) => {
 			const manager = MCPManager.instance();

@@ -15,6 +15,40 @@ export interface McpResourceReadOptions {
 	signal?: AbortSignal;
 }
 
+/**
+ * The MCP manager a resource may use for `context`.
+ *
+ * Fail-closed for caller sessions:
+ * - `enableMCP === false` is final even if a stale manager is attached to the session;
+ * - otherwise a manager supplied by the session is used;
+ * - `enableMCP === true` with no manager is final: an enabled session owns its discovery and may
+ *   never borrow the process-global root;
+ * - only a caller with no session, or one that leaves `enableMCP` unset (CLI-style reads that defer
+ *   manager discovery to the process global), falls back to the process-global manager.
+ *
+ * Async because that global slot may still be a deferred loader.
+ */
+export async function loadCallerMcpManager(context?: ResolveContext): Promise<MCPManagerApi | undefined> {
+	const session = context?.session;
+	if (session) {
+		if (session.enableMCP === false) return undefined;
+		if (session.mcpManager) return session.mcpManager;
+		if (session.enableMCP === true) return undefined;
+	}
+	return MCPManager.load();
+}
+
+/** Whether {@link loadCallerMcpManager} can answer, without loading a manager it would not use. */
+export function callerMcpAvailable(context?: ResolveContext): boolean {
+	const session = context?.session;
+	if (session) {
+		if (session.enableMCP === false) return false;
+		if (session.mcpManager) return true;
+		if (session.enableMCP === true) return false;
+	}
+	return MCPManager.available();
+}
+
 function getUriTemplateMatchScore(
 	uri: string,
 	uriTemplate: string,
@@ -214,7 +248,7 @@ export class McpProtocolHandler implements ProtocolHandler {
 	}
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
-		const mcpManager = await MCPManager.load();
+		const mcpManager = await loadCallerMcpManager(context);
 		if (!mcpManager) {
 			throw new Error("No MCP manager available. MCP servers may not be configured.");
 		}
