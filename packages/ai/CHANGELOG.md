@@ -4,27 +4,78 @@
 
 ### Added
 
-- Added `setUnpausedProviders()` (`@oh-my-pi/pi-ai/oauth`) to turn providers paused in their auth rules back on; loaded credential pools pick up the change, and an extension login taking a paused id, on their next read
+- `buildAnthropicSearchHeaders` takes `extraBetas`, request-specific betas sent beside the web search beta ([#18125](https://github.com/can1357/oh-my-pi/pull/18125) by [@will-bogusz](https://github.com/will-bogusz))
+- Added `omitDemotedReasoning` to `StreamOptions`: an Anthropic request leaves out other models' reasoning that it would otherwise replay as text, and a refused request reports how many such blocks it carried in `demotedReasoningBlocks` ([#10407](https://github.com/can1357/oh-my-pi/issues/10407)) ([#17610](https://github.com/can1357/oh-my-pi/pull/17610) by [@will-bogusz](https://github.com/will-bogusz))
+- Added `metadata.credentialId` to usage reports probed from stored credential rows (API-key and OAuth), and a read-only `AuthStorage.sessions.sticky` lookup of the credential a session is currently served from ([#19456](https://github.com/can1357/oh-my-pi/issues/19456)) ([#19492](https://github.com/can1357/oh-my-pi/pull/19492) by [@thekitaev](https://github.com/thekitaev)).
+- Added `riskAcknowledgement` to `OAuthPrompt`, set on the login-warning acceptance prompt so hosts that refuse input before the auth URL can still show it ([#19523](https://github.com/can1357/oh-my-pi/issues/19523))
+
+### Fixed
+
+- Fixed OpenAI Decisions judge usage reading as zero from gateways such as Bifrost that report `prompt_tokens`/`completion_tokens` instead of `input_tokens`/`output_tokens` ([#19053](https://github.com/can1357/oh-my-pi/pull/19053) by [@Xytronix](https://github.com/Xytronix))
+- Fenced (```thinking) reasoning with very long unbroken lines no longer slows down as it streams ([#19493](https://github.com/can1357/oh-my-pi/pull/19493) by [@H4vC](https://github.com/H4vC))
+- Fixed Anthropic requests that replay a signed server-compaction block still asking for a message thread, which the API refuses (`thread_unsupported_request`), so every such request first paid a rejected round trip before resending without the thread ([#19473](https://github.com/can1357/oh-my-pi/pull/19473) by [@alphastorm](https://github.com/alphastorm))
+- Anthropic requests whose connection drops before any response now say how long after the request started it dropped and whether the request body was still uploading or had all been written to the socket, with its size, instead of a bare "Connection error." ([#18624](https://github.com/can1357/oh-my-pi/pull/18624) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed Anthropic requests dropping the reasoning of earlier non-Claude turns signed in under another credential, or kept through a compaction; it is now replayed like other models' reasoning ([#7241](https://github.com/can1357/oh-my-pi/issues/7241)) ([#17610](https://github.com/can1357/oh-my-pi/pull/17610) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed credential rotation and one-shot retries so custom providers pointing at the Zhipu Coding Plan endpoint honor the Beijing-time quota reset instead of waiting about eight hours too long ([#19446](https://github.com/can1357/oh-my-pi/pull/19446) by [@yuzu-octopus](https://github.com/yuzu-octopus))
+- Fixed Claude Fable and Mythos usage-limit rejections rotating to a sibling account that still has quota, instead of waiting out the capped account or falling back to another model ([#19484](https://github.com/can1357/oh-my-pi/pull/19484) by [@BadAd84](https://github.com/BadAd84))
+- Invalid Antigravity CLI tool arguments now return the validation issues and the tool's expected schema to the model instead of ending the turn. ([#19413](https://github.com/can1357/oh-my-pi/pull/19413) by [@SenCha930511](https://github.com/SenCha930511))
+- Abandoned Antigravity CLI login directories without a credential are removed after 24 hours, so cancelled or crashed sign-ins do not accumulate. ([#19420](https://github.com/can1357/oh-my-pi/pull/19420) by [@SenCha930511](https://github.com/SenCha930511))
+- Fixed the managed Antigravity CLI download failing on slow connections and being reported as a sign-in timeout; it now aborts only after 60 seconds with no data and reports the bytes received ([#19463](https://github.com/can1357/oh-my-pi/issues/19463))
+- Fixed Antigravity CLI host tools whose schemas contain mixed-type unions (such as `yield` with a typed output schema) being published as empty objects, which left subagents unable to submit results ([#19502](https://github.com/can1357/oh-my-pi/issues/19502))
+
+## [18.22.0] - 2026-11-16
+
+### Fixed
+
+- Fixed slow streaming of Gemma tool calls with large arguments.
+
+## [18.21.0] - 2026-11-16
+
+### Added
+
+- Added automatic detection of thinking capabilities for previously unknown models, with persistent results and support for alternate effort and token-budget request formats.
+
+## [18.20.3] - 2026-11-16
+
+### Breaking Changes
+
+- Removed the public `isXdDevicePath` export from `providers/cursor-pi-args`. Ranged reads of `xd://` documents now use the standard line-selector behavior.
+
+### Fixed
+
+- Fixed rate-limit handling for Mistral and other OpenAI-compatible providers so requests with no available allowance fail immediately with an actionable error suggesting a model or plan change.
+- Fixed Anthropic OAuth requests for pooled Claude accounts to report accurate device and account information, including after credentials are rotated during a request.
+
+## [18.20.2] - 2026-11-14
+
+### Added
+
+- Added the Antigravity CLI ACP provider with managed installation, Google sign-in, refreshable distributed credentials, host tools, and retained conversations across tool steps and history changes.
+
+## [18.20.1] - 2026-11-14
+
+### Added
+
+- Added `setUnpausedProviders()` to `@oh-my-pi/pi-ai/oauth`, allowing applications to re-enable providers paused by authentication rules; loaded credential pools and extension logins recognize the change on their next read.
 
 ### Changed
 
 - Updated Vertex AI Gemini requests to use the v1beta1 API, restoring support for long Gemini responses.
+- Improved Google Antigravity quota recovery so Gemini 4 Argon access can resume after quota or plan changes when shared Gemini capacity is available.
+- Improved Amazon Bedrock region selection to honor a configured regional endpoint before falling back to `us-east-1`.
 
 ### Fixed
 
-- Gemini 4 responses that exceed a single output segment now continue generating and are delivered as one complete reply across Google, Vertex AI, Gemini CLI, and Antigravity.
-- Fixed Cursor conversations so prompt content added by hooks remains part of the current user message and server-recorded context is replayed correctly on subsequent turns.
-- Improved Google Antigravity quota recovery so Gemini 4 Argon access can be restored after quota or plan changes when shared Gemini capacity is available.
-- Fixed Amazon Bedrock streaming so malformed event frames fail promptly and interrupted responses are retried instead of being treated as complete.
+- Fixed Gemini 4 responses that exceed a single output segment across Google, Vertex AI, Gemini CLI, and Antigravity, ensuring long responses continue generating and are delivered as one complete reply.
+- Fixed Cursor conversations so hook-added prompt content remains in the current user message and conversation context is correctly preserved across turns.
+- Fixed Amazon Bedrock streaming so malformed responses fail promptly and interrupted responses are retried rather than treated as complete.
 - Fixed Claude account recovery when usage reports contain only one shared usage window.
-- Fixed OpenRouter conversations with Kimi and DeepSeek so prior reasoning is preserved across model switches instead of being replaced with an unavailable-reasoning placeholder.
-- Fixed Xiaomi MiMo Token Plan authentication so token-plan keys use the correct regional endpoint, including for models loaded from bundled or cached configuration.
-- Improved Amazon Bedrock region selection by honoring a configured regional endpoint before falling back to us-east-1.
-- Fixed Perplexity sign-in in the login flow and setup wizard so users can sign in with an email code or choose browser-based SSO.
-- Stopped native judges from retrying gateway errors that indicate all upstream credentials for a model are exhausted, while retaining retries for other transient 502 errors.
+- Fixed OpenRouter conversations with Kimi and DeepSeek so reasoning context is preserved when switching models.
+- Fixed Xiaomi MiMo Token Plan authentication to use the correct regional endpoint, including for models loaded from bundled or cached configuration.
+- Fixed Perplexity sign-in in the login flow and setup wizard, including email-code and browser-based SSO authentication.
+- Stopped native judges from retrying gateway errors caused by exhausted upstream credentials while retaining retries for other transient 502 errors.
 - Fixed simple completion and authenticated gateway chat routes so supported providers receive stop-sequence and frequency-penalty settings.
-- Extensions and response-header diagnostics now receive response notifications for Gemini-family responses, including resumed long responses and regional Vertex AI fallbacks.
-- Fixed Muse sessions failing after credential changes, key rotation, or idle resume by recovering from stale reasoning context and allowing subsequent turns to continue.
+- Fixed Muse sessions after credential changes, key rotation, or idle resume so subsequent turns can continue normally.
 
 ## [18.20.0] - 2026-11-12
 

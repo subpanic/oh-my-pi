@@ -4,18 +4,110 @@
 
 ### Added
 
-- Added optimistic concurrency and alternate-index support to `commitCreate()`: commits can use a separate index file without modifying the repository index and can reject stale commits when `HEAD` has moved.
-- Improved `grep()` and `glob()` performance for ovnfs checkouts by using the serving daemon when supported, while retaining native fallback behavior and existing streaming, filtering, and link-following options.
+- `DesktopFocusReturn.keyboard` says what a macOS takeover did with the user's keyboard (`handedBack`, `leftAsChosen`, `kept`, `frontOnly`, `notSent`) ([#19208](https://github.com/can1357/oh-my-pi/pull/19208) by [@will-bogusz](https://github.com/will-bogusz))
+- Added `desktopWindowRoster()` to `@oh-my-pi/pi-natives/desktop`: every on-screen window on macOS, popup menus, pickers and system prompts included, with owner, layer and whether `listWindows` reports it, in one pass and without a desktop session ([#18925](https://github.com/can1357/oh-my-pi/pull/18925) by [@will-bogusz](https://github.com/will-bogusz))
+- Added `readTreeKeepingSparse()` to seed a private commit index from HEAD while keeping the shared checkout's sparse exclusions; `diffText({ cached: true })`, `commitCreate()` and `writeTree()` now preserve out-of-cone files and collapsed sparse-directory entries ([#19453](https://github.com/can1357/oh-my-pi/pull/19453) by [@yuzu-octopus](https://github.com/yuzu-octopus))
+
+### Changed
+
+- macOS `scroll` now goes the same way as on Windows and Linux: a positive `dy` scrolls down and a positive `dx` right, where macOS scrolled up and left ([#19165](https://github.com/can1357/oh-my-pi/pull/19165) by [@will-bogusz](https://github.com/will-bogusz))
+- Computer `InputBusy` names the agent holding input/focus control and its omp process id (`agent "Main.Scout" (omp pid 4242) owns input/focus control`) when the holder's session set `agentId`, on macOS and Linux, and on Windows when that agent runs in the same omp; cross-process names retain the last 64 characters so long dotted ids keep their distinct suffixes ([#18987](https://github.com/can1357/oh-my-pi/pull/18987) by [@will-bogusz](https://github.com/will-bogusz))
+- Wayland `computer.type()` now types characters your keyboard layout has no key for, such as `ä`, `日本` or emoji, on compositors that offer libei text (KDE Plasma 6.8 and later); elsewhere they are still refused before anything is typed ([#18013](https://github.com/can1357/oh-my-pi/pull/18013) by [@will-bogusz](https://github.com/will-bogusz))
 
 ### Fixed
 
-- Fixed `<text>` elements disappearing from rendered SVGs when a generic font family refers to an unavailable font ([#15181](https://github.com/can1357/oh-my-pi/issues/15181), [#18538](https://github.com/can1357/oh-my-pi/pull/18538)).
-- Fixed `worktree add` with source checkouts containing read-only files or directories, including cleanup and safety issues involving tracked directories replaced by symlinks ([#14190](https://github.com/can1357/oh-my-pi/issues/14190), [#18537](https://github.com/can1357/oh-my-pi/pull/18537)).
-- Fixed cancelled or timed-out `Shell.run` calls so they stop only jobs started by that invocation while preserving the shell session for subsequent runs.
-- Improved shell search behavior across local and network filesystems: local searches no longer descend into network mounts unexpectedly, network-backed walks keep more directory operations in flight, and `fd` uses parallel traversal with support for its ignore, pruning, depth, worker, and error-reporting options.
-- Reduced memory usage in shell visualization for long multi-line commands ([#18791](https://github.com/can1357/oh-my-pi/issues/18791), [#19177](https://github.com/can1357/oh-my-pi/pull/19177)).
-- Fixed the shell `cp` builtin so symlink-following options used with archive and directory-copy modes correctly override one another without disabling recursion or attribute preservation ([#19215](https://github.com/can1357/oh-my-pi/pull/19215)).
-- Fixed a built-in shell crash when `[ ]` or `test` expressions contained very long `-a`/`-o` chains; excessively deep parenthesized expressions now produce a clear error instead ([#18498](https://github.com/can1357/oh-my-pi/pull/18498)).
+- Fixed macOS `press()` on a list row, cell or text that has no press action sending agents to a window click at the element's `bounds()`: the refusal now names the element's own `click()` and lists only actions `perform()` takes ([#19063](https://github.com/can1357/oh-my-pi/pull/19063) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed a macOS coordinate click made before any screenshot telling agents only to take one: the refusal now also names the element's own `click()`, which needs none ([#19063](https://github.com/can1357/oh-my-pi/pull/19063) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed every Windows takeover saying "focus was not confirmed afterwards": it now says where focus went, such as "focus returned to Windows Explorer", as on macOS ([#18298](https://github.com/can1357/oh-my-pi/issues/18298)) ([#19062](https://github.com/can1357/oh-my-pi/pull/19062) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed Windows computer keys and shortcuts typing the wrong characters when the receiving control, including an embedded editor on another UI thread, uses a different keyboard layout from omp ([#19025](https://github.com/can1357/oh-my-pi/pull/19025) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed the macOS `computer` tool failing a click or press on an Activity Monitor process row with `StaleRef` whenever the table refreshed since `ax()` read it: the ref now follows its row when exactly one row still reads as it did in every cell, a click is refused when the app has sorted another row into its place, and the error otherwise shows the row then and now ([#19048](https://github.com/can1357/oh-my-pi/pull/19048) by [@will-bogusz](https://github.com/will-bogusz))
+- Row-ref clicks on macOS check every takeover press and deeply nested row descendants; an off-screen activation primer does not count as a target press when reporting a moved row ([#19048](https://github.com/can1357/oh-my-pi/pull/19048) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed Linux `el.type` putting the agent's text into the field the user was typing in, and reporting success, while it took over the keyboard: GTK fields and Qt multi-line text edits now take printable ASCII text through accessibility, with no keys, focus change or takeover; an unfocused GTK single-line field requires an empty or fully selected value so its selection-on-focus setting cannot cause text loss. On Wayland those fields now take text instead of refusing. Other fields keep the key path, including Qt single-line fields where an accessibility write skips validation ([#19035](https://github.com/can1357/oh-my-pi/pull/19035) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed Linux `press()` on a GTK 3 or Qt combo box opening its list as a popup that took the keyboard, so a user typing elsewhere lost their keys to it: that press is now refused with nothing sent, even when takeover is allowed, naming the options. `setValue("Two")` and `press({ menu: ["Two"] })` choose a GTK 3 or Chromium combo box's option with no popup and check the choice took; Qt combo boxes have no such route and are refused ([#19034](https://github.com/can1357/oh-my-pi/pull/19034) by [@will-bogusz](https://github.com/will-bogusz))
+- macOS `ax()` now shows a toggle in a SwiftUI settings form with the label beside it, and `find({ title })` matches that label, instead of leaving the control unnamed ([#19061](https://github.com/can1357/oh-my-pi/pull/19061) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed macOS `computer` input leaving your window inactive after putting your app back in front, both after a takeover and after background input whose target brought itself forward: the title bar stayed inactive and web pages saw a blur until you clicked, while a takeover reported focus returned ([#19208](https://github.com/can1357/oh-my-pi/pull/19208) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed X11 takeover and desktop typing arriving in the wrong case or layout while Caps Lock, a StickyKeys modifier or a second keyboard layout was active ([#19080](https://github.com/can1357/oh-my-pi/pull/19080) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed X11 takeover keys for a window going to another application that held the keyboard, such as its open menu or a screen locker's password prompt, while the call reported them typed into the window; they now wait up to half a second for such a grab to end and otherwise fail with nothing sent. A menu of the window's own application, or the window itself grabbing the keyboard (a VM viewer, a game), still gets the keys unless another application's popup is above it ([#19066](https://github.com/can1357/oh-my-pi/pull/19066) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed macOS `axSetValue` refusing every option of a Chromium `<select>` (Chrome, Electron) with an empty option list: options are matched by the text Chromium reports as their value, the menu is opened when the closed popup publishes only its chosen option, and the menu is closed afterwards with Escape only when, after `AXCancel`, it neither reports closing nor leaves the window list within 300 ms, as a Chromium menu that ignores the cancel does, instead of being left open with your keystrokes when no option matched ([#19224](https://github.com/can1357/oh-my-pi/pull/19224) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed macOS posting Escape to an application whose background menu had already closed, or whose menu windows could not be read, when closing a menu a click opened: Escape now goes only to a menu window listed right before it, so it cannot cancel a dialog or form in the app instead ([#19224](https://github.com/can1357/oh-my-pi/pull/19224) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed `setValue` on macOS sliders, steppers and other number-valued controls failing with `AXError(-25201)`: the value is now written as a number and read back, and a value the control clamped or rounded is reported with what it now reads ([#19405](https://github.com/can1357/oh-my-pi/pull/19405) by [@will-bogusz](https://github.com/will-bogusz))
+- `setValue` on a macOS control whose value is not settable but that steps (a SwiftUI `Slider`) now refuses naming the `AXIncrement`/`AXDecrement` actions it offers and the number it reads, so the next call can step it ([#19405](https://github.com/can1357/oh-my-pi/pull/19405) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed macOS takeover putting a typing user's keys into the agent's target: a takeover, the background fallback's rerun included, now waits until you have pressed no key or button anywhere for 5 s and hold no modifier or mouse button, failing `UserIntervened` with nothing sent if you are still at it near the run's timeout ([#19296](https://github.com/can1357/oh-my-pi/pull/19296) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed macOS `press()` and background `el.click()` reporting success on a control a person could not click, such as a hover toolbar's button after the pointer left, a hidden control, or one of a window that shows a sheet; they now fail before anything is sent and name what the window shows there ([#19258](https://github.com/can1357/oh-my-pi/pull/19258) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed a background `computer` key press (Space or an up or down arrow) on a macOS popup button or menu button leaving its menu open, which took your typing once omp stopped sending your keys back to your app; the menu now closes before the call returns, and holding those keys on such a control is refused before anything is sent ([#19179](https://github.com/can1357/oh-my-pi/pull/19179) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed Linux `ax()`, `find()`, `el.children()` and focus reads freezing a Qt app with a very long table (up to 45 s, over 1 GB) or knocking it off the accessibility bus, and showing nothing of a GTK 3 list over 65,536 cells; they read only the children they can use, and `ax()` says how many it left out ([#19036](https://github.com/can1357/oh-my-pi/pull/19036) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed macOS background input leaving its target in front after you clicked in your own app while that app was busy or hung, or just before a session's first action; a drag and drop from your app onto the target, or a click on it from a remote-control tool, now counts as choosing it ([#16553](https://github.com/can1357/oh-my-pi/pull/16553) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed Wayland screenshots, and the clicks, drags and scrolls that need them, failing in released Linux builds; without PipeWire installed, `capabilities()` reports `capture: false` and the capture error says why ([#18353](https://github.com/can1357/oh-my-pi/pull/18353) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed a Windows crash in the native IPC transport that left every daemon-served tool hanging after another session closed its pipe mid-operation ([#16045](https://github.com/can1357/oh-my-pi/issues/16045), [#19508](https://github.com/can1357/oh-my-pi/pull/19508) by [@ve3xone](https://github.com/ve3xone))
+- Tree listings now include gitlink modes so selective commits can distinguish submodule pointers from ordinary files ([#19556](https://github.com/can1357/oh-my-pi/pull/19556) by [@kim-dali](https://github.com/kim-dali))
+- Fixed macOS background actions stopping with `UserIntervened` while you typed in your own app and the target briefly took the keyboard, such as when a pop-up button's menu opened ([#19515](https://github.com/can1357/oh-my-pi/pull/19515) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed `commitCreate()` dropping a rejecting `pre-commit`/`commit-msg` hook's stdout from the error; hook output now arrives interleaved in `stderr` and the message, as under `git commit` ([#19449](https://github.com/can1357/oh-my-pi/issues/19449))
+- Block edits (`PUT N*`, `CUT N*`) anchored on the first `#[...]` attribute or `///` doc comment of a Rust item now cover the item, instead of failing as a single-line block ([#19464](https://github.com/can1357/oh-my-pi/pull/19464) by [@acfrazier](https://github.com/acfrazier))
+- Fixed Linux `find()`, `ax()` and element reads taking seconds in large apps: each element's independent accessibility questions now go out together, so `find()` takes about half as long in Kate, Dolphin and LibreOffice Writer ([#19521](https://github.com/can1357/oh-my-pi/pull/19521) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Removed
+
+- Removed the `wayland-pipewire` Cargo feature and `OMP_NATIVE_FEATURES`, which only existed to pass it ([#18353](https://github.com/can1357/oh-my-pi/pull/18353) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.22.0] - 2026-11-16
+
+### Breaking Changes
+
+- `TtyWriter` now requires a drain threshold and callback and only supports independently reopenable TTYs. Its pending UTF-8 byte bounds are reported conservatively.
+
+### Changed
+
+- Large terminal repaints are handled more efficiently, reducing JavaScript-thread work and releasing oversized buffers after output drains.
+
+### Fixed
+
+- Fixed stalled terminal writers continuing to emit output or leaking file descriptors after shutdown.
+- Fixed terminal output preserving Unicode across chunk boundaries and safely replacing malformed surrogate sequences.
+
+## [18.21.0] - 2026-11-16
+
+### Added
+
+- Added the `PhononTts` binding for on-device Phonon text-to-speech.
+- Added `Shell.adopt(fork)` to apply variables, functions, aliases, options, and traps from a completed fork back to its parent shell. When both shells set a name, the value from the command that finished last is retained.
+
+### Fixed
+
+- Fixed concurrent `commitCreate()` calls incorrectly overwriting each other’s commit subject and body.
+
+## [18.20.3] - 2026-11-16
+
+### Fixed
+
+- Committing or writing trees now correctly reports unresolved index conflicts instead of silently omitting conflicted files.
+- Fixed shell compatibility with GNU `grep` for end-of-line-anchored patterns, including `-o` and `-z` modes, and corrected `sed` substitutions on multibyte-character lines.
+- Fixed native diff and patch handling for filenames containing spaces and other characters requiring quoting, including binary changes.
+
+## [18.20.1] - 2026-11-14
+
+### Breaking Changes
+
+- Changed lsTree() to return { path, mode } entries instead of bare paths; mode matches git ls-tree output (for example, 100755 or 120000).
+
+### Added
+
+- Added noVerify to commitCreate() options to skip the pre-commit and commit-msg hooks, matching git commit --no-verify.
+- Added optimistic concurrency and alternate-index support to commitCreate(), allowing commits to use a separate index and reject stale commits when HEAD has changed.
+- Improved grep() and glob() performance for ovnfs checkouts by using the serving daemon when available while preserving native fallback behavior and existing streaming, filtering, and link-following options.
+
+### Changed
+
+- Improved shell search across local and network filesystems: local searches avoid unexpectedly traversing network mounts, network-backed searches perform more directory operations concurrently, and fd supports parallel traversal together with ignore, pruning, depth, worker, and error-reporting options.
+
+### Fixed
+
+- Fixed binary patches produced by diffText({ binary: true }) and diffNoIndex(…, true) for non-UTF-8 text, such as Latin-1, so patches preserve the original bytes and apply correctly.
+- Fixed SVG rendering when a generic font family refers to an unavailable font, preventing <text> elements from disappearing.
+- Fixed worktree add for source checkouts containing read-only files or directories, including cases where tracked directories are replaced by symlinks.
+- Fixed cancelled and timed-out Shell.run calls so they terminate only jobs started by that invocation while preserving the shell session for later runs.
+- Reduced memory usage when visualizing long multi-line shell commands.
+- Fixed the shell cp builtin so symlink-following options work correctly with archive and directory-copy modes without disabling recursion or attribute preservation.
+- Replaced built-in shell crashes on very long -a/-o chains in [ ] and test expressions with a clear error for excessively deep expressions.
 
 ## [18.20.0] - 2026-11-12
 

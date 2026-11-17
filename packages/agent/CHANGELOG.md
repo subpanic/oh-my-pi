@@ -4,7 +4,14 @@
 
 ### Fixed
 
-- Fixed context cost estimates for routes that omit reasoning history, ensuring thinking text is only included in billing estimates when it is actually sent or reconstructed for a tool call.
+- Provider replay (`filterProviderReplayMessages`, the default `convertToLlm`) now sends a tool call stopped by a provider error as "not executed" without the provider's error text, so a refusal explanation is never fed back to the model ([#19419](https://github.com/can1357/oh-my-pi/pull/19419) by [@flosrn](https://github.com/flosrn))
+- Fixed one-shot retries and title generation to pass the model endpoint so custom Zhipu Coding Plan providers honor the Beijing-time quota reset ([#19446](https://github.com/can1357/oh-my-pi/pull/19446) by [@yuzu-octopus](https://github.com/yuzu-octopus))
+
+## [18.20.1] - 2026-11-14
+
+### Fixed
+
+- Corrected context cost estimates for requests that omit reasoning history, so billing estimates now include thinking text only when it is sent or reconstructed for a tool call.
 
 ## [18.20.0] - 2026-11-12
 
