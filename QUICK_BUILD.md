@@ -67,6 +67,18 @@ bun --cwd=packages/coding-agent run build
 
 No need to repeat `bun setup` or reinstall the toolchains. For faster native iteration, omit `env OMP_NATIVE_CARGO_PROFILE=release`; the default `local` profile uses thin LTO and incremental compilation.
 
+## Deploy to the local fork install (macOS)
+
+If `~/.local/bin/omp` already points to `~/.local/lib/omp-fork/bin/omp`, run this from the checkout root:
+
+```sh
+./scripts/deploy-local-fork.sh
+```
+
+The script builds for the current Mac, runs `--smoke-test` with a temporary home, and replaces the installed binary only if both pass. The PATH symlink and `manager.json` stay in place, so new `omp` invocations use the fork and `omp update` leaves it alone.
+
+The script reuses the native addon. If dependencies or native inputs changed, run `bun install` and `bun run build:native` first. To target another existing managed fork install, set `OMP_FORK_INSTALL_DIR` to its absolute root path (the directory containing `manager.json` and `bin/omp`).
+
 ## Common build messages
 
 - **`bun: No such file or directory` / `cargo metadata failed to run`:** check `bun --version` and `cargo --version`; ensure both toolchain directories are on PATH. If Cargo is available, run `cargo metadata --manifest-path crates/pi-natives/Cargo.toml --no-deps --format-version 1` to expose the underlying metadata error.

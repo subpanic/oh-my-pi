@@ -5187,7 +5187,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					throw error;
 				}
 			}
-			const mcpManager = enableMCP ? options.mcpManager : undefined;
+			const mcpManager = mcpLease?.manager;
 
 			if (options.parentTelemetry && subagentAgentIdentity) {
 				const parentTelemetryHandle = resolveTelemetry(
